@@ -21,6 +21,7 @@ class RegexTests(unittest.TestCase):
     INVALID_GROUP_REF = "invalid group reference"
     MISSING_GT = "missing >"
     BAD_GROUP_NAME = "bad character in group name"
+    BAD_OFFSET = "bad character in offset"
     MISSING_GROUP_NAME = "missing group name"
     MISSING_LT = "missing <"
     UNKNOWN_GROUP_I = "unknown group"
@@ -1758,6 +1759,23 @@ class RegexTests(unittest.TestCase):
               self.BAD_GROUP_NAME),
             ('(?P<foo_123>a)(?P=foo_124)', 'aa', '', regex.error,
               self.UNKNOWN_GROUP),  # Backref to undefined group.
+            
+            # Relative reference.
+            ('(?V1)(?P<foo_123>a)(?P=-1)', 'aa', '1', ascii('a')),
+            ('(?V1)(?P<foo>a)?(?(-1)b)', 'ab', '0', ascii('ab')),
+            ('(?V1)(?P<foo>a)?(?(-1)b|c)', 'bc', '0', ascii('c')),
+            ('(?V1)(?(DEFINE)(?<foo>a))(?-1)', 'a', '0', ascii('a')),
+            ('(?V1)(?+1)(?(DEFINE)(?<foo>a))', 'a', '0', ascii('a')),
+            ('(?V1)a(?-2)?', 'a', '', regex.error, self.UNKNOWN_GROUP),
+            ('(?V1)a(?+1)?', 'a', '', regex.error, self.UNKNOWN_GROUP),
+            ('(?V1)a(?+0)?', 'a', '', regex.error, self.BAD_OFFSET),
+            ('(?V1)a(?-1)?', 'a', '0', ascii("a")),
+            ('(?V1)a(?-)?', 'a', '', regex.error, self.BAD_OFFSET),
+            # Anchored relative reference.
+            ('(?V1)(?P<foo>a)(?P<bar>b)(?P=bar-1)', 'aba', '0', ascii('aba')),
+            ('(?V1)(?P<foo>a)(?P<bar>b)(?P=foo+1)', 'abb', '0', ascii('abb')),
+            ('(?V1)(?&bar-1)(?(DEFINE)(?<foo>a)(?<bar>b))', 'a', '0', ascii('a')),
+            ('(?V1)(?&foo+1)(?(DEFINE)(?<foo>a)(?<bar>b))', 'b', '0', ascii('b')),
 
             ('(?P<foo_123>a)', 'a', '1', ascii('a')),
             ('(?P<foo_123>a)(?P=foo_123)', 'aa', '1', ascii('a')),

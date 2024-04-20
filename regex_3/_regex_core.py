@@ -399,9 +399,9 @@ def make_character(info, value, in_set=False):
 
     return Character(value, case_flags=make_case_flags(info))
 
-def make_ref_group(info, name, position):
+def make_ref_group(info, name, offset, position):
     "Makes a group reference."
-    return RefGroup(info, name, position, case_flags=make_case_flags(info))
+    return RefGroup(info, name, offset, position, case_flags=make_case_flags(info))
 
 def make_string_set(info, name):
     "Makes a string set."
@@ -851,6 +851,13 @@ def parse_paren(source, info):
         if ch == "|":
             # (?|...: a common/reset groups branch.
             return parse_common(source, info)
+        if ch in "+-":
+            version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
+            if version == VERSION1:
+                # (?+...: relative group call
+                offset = parse_offset(source, ch)
+                source.expect(")")
+                return CallGroup(info, None, offset, saved_pos_2)
         if ch == "R" or "0" <= ch <= "9":
             # (?R...: probably a call to a group.
             return parse_call_group(source, info, ch, saved_pos_2)
@@ -912,13 +919,20 @@ def parse_extension(source, info):
         return Group(info, group, subpattern)
     if ch == "=":
         # (?P=...: a named group reference.
-        name = parse_name(source, allow_numeric=True)
+        version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
+        if version == VERSION1:
+            name = parse_name(source, allow_numeric=True, allow_offset=True,
+              allow_empty=True)
+            offset = parse_offset(source, allow_empty=bool(name))
+        else:
+            name = parse_name(source, allow_numeric=True)
+            offset = None
         source.expect(")")
-        if info.is_open_group(name):
+        if name and info.is_open_group(name):
             raise error("cannot refer to an open group", source.string,
               saved_pos)
 
-        return make_ref_group(info, name, saved_pos)
+        return make_ref_group(info, name, offset, saved_pos)
     if ch == ">" or ch == "&":
         # (?P>...: a call to a group.
         return parse_call_named_group(source, info, saved_pos)
@@ -980,7 +994,14 @@ def parse_conditional(source, info):
 
     source.pos = saved_pos
     try:
-        group = parse_name(source, True)
+        version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
+        if version == VERSION1:
+            group = parse_name(source, allow_numeric=True, allow_offset=True,
+              allow_empty=True)
+            offset = parse_offset(source, allow_empty=bool(group))
+        else:
+            group = parse_name(source, allow_numeric=True)
+            offset = None
         source.expect(")")
         yes_branch = parse_sequence(source, info)
         if source.match("|"):
@@ -996,7 +1017,7 @@ def parse_conditional(source, info):
     if yes_branch.is_empty() and no_branch.is_empty():
         return Sequence()
 
-    return Conditional(info, group, yes_branch, no_branch, saved_pos)
+    return Conditional(info, group, offset, yes_branch, no_branch, saved_pos)
 
 def parse_lookaround_conditional(source, info, behind, positive):
     saved_flags = info.flags
@@ -1057,14 +1078,20 @@ def parse_call_group(source, info, ch, pos):
 
     source.expect(")")
 
-    return CallGroup(info, group, pos)
+    return CallGroup(info, group, None, pos)
 
 def parse_call_named_group(source, info, pos):
     "Parses a call to a named group."
-    group = parse_name(source)
+    version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
+    if version == VERSION1:
+        group = parse_name(source, allow_offset=True)
+        offset = parse_offset(source, allow_empty=True)
+    else:
+        group = parse_name(source)
+        offset = None
     source.expect(")")
 
-    return CallGroup(info, group, pos)
+    return CallGroup(info, group, offset, pos)
 
 def parse_flag_set(source):
     "Parses a set of inline flags."
@@ -1153,11 +1180,18 @@ def parse_positional_flags(source, info, flags_on, flags_off):
     info.flags = (info.flags | flags_on) & ~flags_off
     source.ignore_space = bool(info.flags & VERBOSE)
 
-def parse_name(source, allow_numeric=False, allow_group_0=False):
+def parse_name(source, allow_numeric=False, allow_group_0=False,
+  allow_offset=False, allow_empty=False):
     "Parses a name."
-    name = source.get_while(set(")>"), include=False)
+    if allow_offset:
+        char_set = ")>+-"
+    else:
+        char_set = ")>"
+    name = source.get_while(set(char_set), include=False)
 
     if not name:
+        if allow_empty:
+            return None
         raise error("missing group name", source.string, source.pos)
 
     if name.isdigit():
@@ -1171,6 +1205,42 @@ def parse_name(source, allow_numeric=False, allow_group_0=False):
               source.pos)
 
     return name
+
+def parse_offset(source, sign=None, allow_empty=False):
+    "Parses an offset."
+    if not sign:
+        saved_pos = source.pos
+        ch = source.get()
+        if ch == "+":
+            sign = 1
+        elif ch == "-":
+            sign = -1
+        else:
+            if allow_empty:
+                source.pos = saved_pos
+                return None
+            raise error("bad character in offset", source.string, saved_pos)
+    elif sign == "+":
+        sign = 1
+    elif sign == "-":
+        sign = -1
+    else:
+        if allow_empty:
+            return None
+        raise error("bad character in offset", source.string, source.pos)
+    
+    offset = source.get_while(DIGITS)
+    
+    if not offset:
+        raise error("bad character in offset", source.string, source.pos)
+    
+    offset = int(offset)
+    
+    if offset == 0:
+        if allow_empty:
+            return None
+        raise error("bad character in offset", source.string, source.pos)
+    return sign * offset
 
 def is_octal(string):
     "Checks whether a string is octal."
@@ -1288,7 +1358,7 @@ def parse_numeric_escape(source, info, ch, in_set):
     if info.is_open_group(digits):
         raise error("cannot refer to an open group", source.string, source.pos)
 
-    return make_ref_group(info, digits, source.pos)
+    return make_ref_group(info, digits, None, source.pos)
 
 def parse_octal_escape(source, info, digits, in_set):
     "Parses an octal escape sequence."
@@ -1338,12 +1408,19 @@ def parse_group_ref(source, info):
     "Parses a group reference."
     source.expect("<")
     saved_pos = source.pos
-    name = parse_name(source, True)
+    version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
+    if version == VERSION1:
+        name = parse_name(source, allow_numeric=True, allow_offset=True,
+          allow_empty=True)
+        offset = parse_offset(source, allow_empty=bool(name))
+    else:
+        name = parse_name(source, allow_numeric=True)
+        offset = None
     source.expect(">")
-    if info.is_open_group(name):
+    if name and info.is_open_group(name):
         raise error("cannot refer to an open group", source.string, source.pos)
 
-    return make_ref_group(info, name, saved_pos)
+    return make_ref_group(info, name, offset, saved_pos)
 
 def parse_string_set(source, info):
     "Parses a string set reference."
@@ -1867,8 +1944,8 @@ class RegexBase:
 
         return self.rebuild(positive, case_flags, zerowidth)
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        pass
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        return last_group
 
     def optimise(self, info, reverse):
         return self
@@ -1972,8 +2049,8 @@ class Atomic(RegexBase):
         RegexBase.__init__(self)
         self.subpattern = subpattern
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.subpattern.fix_groups(pattern, reverse, fuzzy)
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        return self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
 
     def optimise(self, info, reverse):
         self.subpattern = self.subpattern.optimise(info, reverse)
@@ -2032,9 +2109,10 @@ class Branch(RegexBase):
         RegexBase.__init__(self)
         self.branches = branches
 
-    def fix_groups(self, pattern, reverse, fuzzy):
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
         for b in self.branches:
-            b.fix_groups(pattern, reverse, fuzzy)
+            last_group = b.fix_groups(pattern, reverse, fuzzy, last_group)
+        return last_group
 
     def optimise(self, info, reverse):
         if not self.branches:
@@ -2420,22 +2498,32 @@ class Branch(RegexBase):
         return max(b.max_width() for b in self.branches)
 
 class CallGroup(RegexBase):
-    def __init__(self, info, group, position):
+    def __init__(self, info, group, offset, position):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
+        self.offset = offset
         self.position = position
 
-        self._key = self.__class__, self.group
+        self._key = self.__class__, self.group, self.offset
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        try:
-            self.group = int(self.group)
-        except ValueError:
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        if not self.group and self.offset:
+            self.group = last_group + self.offset
+            if self.offset < 0:
+                self.group += 1
+        else:
             try:
-                self.group = self.info.group_index[self.group]
-            except KeyError:
-                raise error("invalid group reference", pattern, self.position)
+                self.group = int(self.group)
+            except ValueError:
+                try:
+                    self.group = self.info.group_index[self.group]
+                except KeyError:
+                    raise error("invalid group reference", pattern, self.position)
+            if self.offset:
+                self.group += self.offset
+        
+        self.offset = None
 
         if not 0 <= self.group <= self.info.group_count:
             raise error("unknown group", pattern, self.position)
@@ -2445,8 +2533,8 @@ class CallGroup(RegexBase):
 
         self.info.group_calls.append((self, reverse, fuzzy))
 
-        self._key = self.__class__, self.group
-
+        self._key = self.__class__, self.group, self.offset
+        
     def remove_captures(self):
         raise error("group reference not allowed", pattern, self.position)
 
@@ -2454,7 +2542,8 @@ class CallGroup(RegexBase):
         return [(OP.GROUP_CALL, self.call_ref)]
 
     def dump(self, indent, reverse):
-        print("{}GROUP_CALL {}".format(INDENT * indent, self.group))
+        print("{}GROUP_CALL {}{}".format(INDENT * indent,
+          self.group or "", self.offset or ""))
 
     def __eq__(self, other):
         return type(self) is type(other) and self.group == other.group
@@ -2549,15 +2638,20 @@ class Character(RegexBase):
         return 0, self
 
 class Conditional(RegexBase):
-    def __init__(self, info, group, yes_item, no_item, position):
+    def __init__(self, info, group, offset, yes_item, no_item, position):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
+        self.offset = offset
         self.yes_item = yes_item
         self.no_item = no_item
         self.position = position
 
-    def fix_groups(self, pattern, reverse, fuzzy):
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        if not self.group and self.offset:
+            self.group = last_group + self.offset
+            if self.offset < 0:
+                self.group += 1
         try:
             self.group = int(self.group)
         except ValueError:
@@ -2568,20 +2662,26 @@ class Conditional(RegexBase):
                     # 'DEFINE' is a special name unless there's a group with
                     # that name.
                     self.group = 0
+                    if self.offset:
+                        raise error("invalid offset", pattern, self.position)
                 else:
                     raise error("unknown group", pattern, self.position)
+            if self.offset:
+                self.group += self.offset
+        
+        self.offset = None
 
         if not 0 <= self.group <= self.info.group_count:
             raise error("invalid group reference", pattern, self.position)
 
-        self.yes_item.fix_groups(pattern, reverse, fuzzy)
-        self.no_item.fix_groups(pattern, reverse, fuzzy)
+        last_group = self.yes_item.fix_groups(pattern, reverse, fuzzy, last_group)
+        return self.no_item.fix_groups(pattern, reverse, fuzzy, last_group)
 
     def optimise(self, info, reverse):
         yes_item = self.yes_item.optimise(info, reverse)
         no_item = self.no_item.optimise(info, reverse)
 
-        return Conditional(info, self.group, yes_item, no_item, self.position)
+        return Conditional(info, self.group, self.offset, yes_item, no_item, self.position)
 
     def pack_characters(self, info):
         self.yes_item = self.yes_item.pack_characters(info)
@@ -2618,7 +2718,8 @@ class Conditional(RegexBase):
         return code
 
     def dump(self, indent, reverse):
-        print("{}GROUP_EXISTS {}".format(INDENT * indent, self.group))
+        print("{}GROUP_EXISTS {}{}".format(INDENT * indent,
+          self.group or "", self.offset or ""))
         self.yes_item.dump(indent + 1, reverse)
         if not self.no_item.is_empty():
             print("{}OR".format(INDENT * indent))
@@ -2628,8 +2729,9 @@ class Conditional(RegexBase):
         return self.yes_item.is_empty() and self.no_item.is_empty()
 
     def __eq__(self, other):
-        return type(self) is type(other) and (self.group, self.yes_item,
-          self.no_item) == (other.group, other.yes_item, other.no_item)
+        return type(self) is type(other) and (self.group, self.offset,
+          self.yes_item, self.no_item) == (other.group, other.offset,
+          other.yes_item, other.no_item)
 
     def max_width(self):
         return max(self.yes_item.max_width(), self.no_item.max_width())
@@ -2715,8 +2817,8 @@ class Fuzzy(RegexBase):
             constraints["cost"] = {"d": 1, "i": 1, "s": 1, "max":
               constraints["e"][1]}
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.subpattern.fix_groups(pattern, reverse, True)
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        return self.subpattern.fix_groups(pattern, reverse, True, last_group)
 
     def pack_characters(self, info):
         self.subpattern = self.subpattern.pack_characters(info)
@@ -2841,8 +2943,8 @@ class GreedyRepeat(RegexBase):
         self.min_count = min_count
         self.max_count = max_count
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.subpattern.fix_groups(pattern, reverse, fuzzy)
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        return self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, reverse)
@@ -2962,9 +3064,9 @@ class Group(RegexBase):
 
         self.call_ref = None
 
-    def fix_groups(self, pattern, reverse, fuzzy):
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
         self.info.defined_groups[self.group] = (self, reverse, fuzzy)
-        self.subpattern.fix_groups(pattern, reverse, fuzzy)
+        return self.subpattern.fix_groups(pattern, reverse, fuzzy, self.group)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, reverse)
@@ -3052,8 +3154,8 @@ class LookAround(RegexBase):
         self.positive = bool(positive)
         self.subpattern = subpattern
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.subpattern.fix_groups(pattern, self.behind, fuzzy)
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        return self.subpattern.fix_groups(pattern, self.behind, fuzzy, last_group)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, self.behind)
@@ -3122,10 +3224,10 @@ class LookAroundConditional(RegexBase):
         self.yes_item = yes_item
         self.no_item = no_item
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.subpattern.fix_groups(pattern, reverse, fuzzy)
-        self.yes_item.fix_groups(pattern, reverse, fuzzy)
-        self.no_item.fix_groups(pattern, reverse, fuzzy)
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        last_group = self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
+        last_group = self.yes_item.fix_groups(pattern, reverse, fuzzy, last_group)
+        return self.no_item.fix_groups(pattern, reverse, fuzzy, last_group)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, self.behind)
@@ -3345,28 +3447,38 @@ class RefGroup(RegexBase):
       True): OP.REF_GROUP_IGN_REV, (FULLCASE, True): OP.REF_GROUP_REV,
       (FULLIGNORECASE, True): OP.REF_GROUP_FLD_REV}
 
-    def __init__(self, info, group, position, case_flags=NOCASE):
+    def __init__(self, info, group, offset, position, case_flags=NOCASE):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
+        self.offset = offset
         self.position = position
         self.case_flags = CASE_FLAGS_COMBINATIONS[case_flags]
 
-        self._key = self.__class__, self.group, self.case_flags
+        self._key = self.__class__, self.group, self.offset, self.case_flags
 
-    def fix_groups(self, pattern, reverse, fuzzy):
-        try:
-            self.group = int(self.group)
-        except ValueError:
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+        if not self.group and self.offset:
+            self.group = last_group + self.offset
+            if self.offset < 0:
+                self.group += 1
+        else:
             try:
-                self.group = self.info.group_index[self.group]
-            except KeyError:
-                raise error("unknown group", pattern, self.position)
+                self.group = int(self.group)
+            except ValueError:
+                try:
+                    self.group = self.info.group_index[self.group]
+                except KeyError:
+                    raise error("unknown group", pattern, self.position)
+            if self.offset:
+                self.group += self.offset
+        
+        self.offset = None
 
         if not 1 <= self.group <= self.info.group_count:
             raise error("invalid group reference", pattern, self.position)
 
-        self._key = self.__class__, self.group, self.case_flags
+        self._key = self.__class__, self.group, self.offset, self.case_flags
 
     def remove_captures(self):
         raise error("group reference not allowed", pattern, self.position)
@@ -3378,8 +3490,8 @@ class RefGroup(RegexBase):
         return [(self._opcode[self.case_flags, reverse], flags, self.group)]
 
     def dump(self, indent, reverse):
-        print("{}REF_GROUP {}{}".format(INDENT * indent, self.group,
-          CASE_TEXT[self.case_flags]))
+        print("{}REF_GROUP {}{}{}".format(INDENT * indent,
+          self.group or "", self.offset or "", CASE_TEXT[self.case_flags]))
 
     def max_width(self):
         return UNLIMITED
@@ -3399,9 +3511,10 @@ class Sequence(RegexBase):
 
         self.items = items
 
-    def fix_groups(self, pattern, reverse, fuzzy):
+    def fix_groups(self, pattern, reverse, fuzzy, last_group):
         for s in self.items:
-            s.fix_groups(pattern, reverse, fuzzy)
+            last_group = s.fix_groups(pattern, reverse, fuzzy, last_group)
+        return last_group
 
     def optimise(self, info, reverse):
         # Flatten the sequences.

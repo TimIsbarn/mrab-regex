@@ -571,7 +571,7 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
     # Fix the group references.
     caught_exception = None
     try:
-        parsed.fix_groups(pattern, reverse, False)
+        parsed.fix_groups(pattern, reverse, False, 0)
     except error as e:
         caught_exception = e
 
