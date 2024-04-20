@@ -23,8 +23,8 @@ import regex._regex as _regex
 __all__ = ["A", "ASCII", "B", "BESTMATCH", "D", "DEBUG", "E", "ENHANCEMATCH",
   "F", "FULLCASE", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "P",
   "POSIX", "R", "REVERSE", "S", "DOTALL", "T", "TEMPLATE", "U", "UNICODE",
-  "V0", "VERSION0", "V1", "VERSION1", "W", "WORD", "X", "VERBOSE", "error",
-  "Scanner", "RegexFlag"]
+  "V0", "VERSION0", "V1", "VERSION1", "W", "WORD", "X", "VERBOSE", "XX",
+  "FULLVERBOSE", "error", "Scanner", "RegexFlag"]
 
 # The regex exception.
 class error(Exception):
@@ -71,24 +71,25 @@ class _FirstSetError(Exception):
 
 # Flags.
 class RegexFlag(enum.IntFlag):
-    A = ASCII = 0x80          # Assume ASCII locale.
-    B = BESTMATCH = 0x1000    # Best fuzzy match.
-    D = DEBUG = 0x200         # Print parsed pattern.
-    E = ENHANCEMATCH = 0x8000 # Attempt to improve the fit after finding the first
-                              # fuzzy match.
-    F = FULLCASE = 0x4000     # Unicode full case-folding.
-    I = IGNORECASE = 0x2      # Ignore case.
-    L = LOCALE = 0x4          # Assume current 8-bit locale.
-    M = MULTILINE = 0x8       # Make anchors look for newline.
-    P = POSIX = 0x10000       # POSIX-style matching (leftmost longest).
-    R = REVERSE = 0x400       # Search backwards.
-    S = DOTALL = 0x10         # Make dot match newline.
-    U = UNICODE = 0x20        # Assume Unicode locale.
-    V0 = VERSION0 = 0x2000    # Old legacy behaviour.
-    V1 = VERSION1 = 0x100     # New enhanced behaviour.
-    W = WORD = 0x800          # Default Unicode word breaks.
-    X = VERBOSE = 0x40        # Ignore whitespace and comments.
-    T = TEMPLATE = 0x1        # Template (present because re module has it).
+    A = ASCII = 0x80           # Assume ASCII locale.
+    B = BESTMATCH = 0x1000     # Best fuzzy match.
+    D = DEBUG = 0x200          # Print parsed pattern.
+    E = ENHANCEMATCH = 0x8000  # Attempt to improve the fit after finding the first
+                               # fuzzy match.
+    F = FULLCASE = 0x4000      # Unicode full case-folding.
+    I = IGNORECASE = 0x2       # Ignore case.
+    L = LOCALE = 0x4           # Assume current 8-bit locale.
+    M = MULTILINE = 0x8        # Make anchors look for newline.
+    P = POSIX = 0x10000        # POSIX-style matching (leftmost longest).
+    R = REVERSE = 0x400        # Search backwards.
+    S = DOTALL = 0x10          # Make dot match newline.
+    U = UNICODE = 0x20         # Assume Unicode locale.
+    V0 = VERSION0 = 0x2000     # Old legacy behaviour.
+    V1 = VERSION1 = 0x100      # New enhanced behaviour.
+    W = WORD = 0x800           # Default Unicode word breaks.
+    X = VERBOSE = 0x40         # Ignore whitespace and comments outside of sets.
+    XX = FULLVERBOSE = 0x20000 # Ignore whitespace and comments.
+    T = TEMPLATE = 0x1         # Template (present because re module has it).
 
     def __repr__(self):
         if self._name_ is not None:
@@ -127,6 +128,7 @@ DEFAULT_VERSION = VERSION1
 
 _ALL_VERSIONS = VERSION0 | VERSION1
 _ALL_ENCODINGS = ASCII | LOCALE | UNICODE
+_ALL_VERBOSE = VERBOSE | FULLVERBOSE
 
 # The default flags for the various versions.
 DEFAULT_FLAGS = {VERSION0: 0, VERSION1: FULLCASE}
@@ -134,8 +136,8 @@ DEFAULT_FLAGS = {VERSION0: 0, VERSION1: FULLCASE}
 # The mask for the flags.
 GLOBAL_FLAGS = (_ALL_VERSIONS | BESTMATCH | DEBUG | ENHANCEMATCH | POSIX |
   REVERSE)
-SCOPED_FLAGS = (FULLCASE | IGNORECASE | MULTILINE | DOTALL | WORD | VERBOSE |
-  _ALL_ENCODINGS)
+SCOPED_FLAGS = (FULLCASE | FULLVERBOSE | IGNORECASE | MULTILINE | DOTALL |
+  WORD | VERBOSE | _ALL_ENCODINGS)
 
 ALPHA = frozenset(string.ascii_letters)
 DIGITS = frozenset(string.digits)
@@ -158,7 +160,7 @@ UNLIMITED = (1 << BITS_PER_CODE) - 1
 REGEX_FLAGS = {"a": ASCII, "b": BESTMATCH, "e": ENHANCEMATCH, "f": FULLCASE,
   "i": IGNORECASE, "L": LOCALE, "m": MULTILINE, "p": POSIX, "r": REVERSE,
   "s": DOTALL, "u": UNICODE, "V0": VERSION0, "V1": VERSION1, "w": WORD, "x":
-  VERBOSE}
+  VERBOSE, "X": FULLVERBOSE}
 
 # The case flags.
 CASE_FLAGS = FULLCASE | IGNORECASE
@@ -829,7 +831,8 @@ def parse_paren(source, info):
                 source.expect(")")
             finally:
                 info.flags = saved_flags
-                source.ignore_space = bool(info.flags & VERBOSE)
+                source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+                source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
             info.close_group()
             return Group(info, group, subpattern)
@@ -891,7 +894,8 @@ def parse_paren(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     info.close_group()
 
@@ -912,7 +916,8 @@ def parse_extension(source, info):
             source.expect(")")
         finally:
             info.flags = saved_flags
-            source.ignore_space = bool(info.flags & VERBOSE)
+            source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+            source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
         info.close_group()
 
@@ -965,7 +970,8 @@ def parse_lookaround(source, info, behind, positive):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     return LookAround(behind, positive, subpattern)
 
@@ -1012,7 +1018,8 @@ def parse_conditional(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     if yes_branch.is_empty() and no_branch.is_empty():
         return Sequence()
@@ -1026,7 +1033,8 @@ def parse_lookaround_conditional(source, info, behind, positive):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     yes_branch = parse_sequence(source, info)
     if source.match("|"):
@@ -1047,7 +1055,8 @@ def parse_atomic(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     return Atomic(subpattern)
 
@@ -1130,13 +1139,15 @@ def parse_subpattern(source, info, flags_on, flags_off):
     "Parses a subpattern with scoped flags."
     saved_flags = info.flags
     info.flags = (info.flags | flags_on) & ~flags_off
-    source.ignore_space = bool(info.flags & VERBOSE)
+    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
     try:
         subpattern = _parse_pattern(source, info)
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & VERBOSE)
+        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
     return subpattern
 
@@ -1178,7 +1189,8 @@ def parse_flags_subpattern(source, info):
 def parse_positional_flags(source, info, flags_on, flags_off):
     "Parses positional flags."
     info.flags = (info.flags | flags_on) & ~flags_off
-    source.ignore_space = bool(info.flags & VERBOSE)
+    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
 
 def parse_name(source, allow_numeric=False, allow_group_0=False,
   allow_offset=False, allow_empty=False):
@@ -1496,7 +1508,8 @@ def parse_set(source, info):
     version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
 
     saved_ignore = source.ignore_space
-    source.ignore_space = False
+    if not source.ignore_set_space:
+        source.ignore_space = False
     # Negative set?
     negate = source.match("^")
     try:
@@ -4457,7 +4470,8 @@ class Scanner:
             # Parse the regular expression.
             source = Source(phrase)
             info = Info(flags, source.char_type)
-            source.ignore_space = bool(info.flags & VERBOSE)
+            source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+            source.ignore_set_space = bool(info.flags & FULLVERBOSE)
             parsed = _parse_pattern(source, info)
             if not source.at_end():
                 raise error("unbalanced parenthesis", source.string,

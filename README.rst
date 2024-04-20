@@ -66,6 +66,8 @@ In order to be compatible with the re module, this module has 2 behaviours:
 
   * Case-insensitive matches in Unicode use simple case-folding by default.
 
+  * No relative group references.
+
 * **Version 1** behaviour (new behaviour, possibly different from the re module):
 
   * Indicated by the ``VERSION1`` flag.
@@ -77,6 +79,8 @@ In order to be compatible with the re module, this module has 2 behaviours:
   * Nested sets and set operations are supported.
 
   * Case-insensitive matches in Unicode use full case-folding by default.
+
+  * Relative group references.
 
 If no version is specified, the regex module will default to ``regex.DEFAULT_VERSION``.
 

@@ -225,7 +225,9 @@ these flags can also be set within an RE:
     W   w   WORD          Make \b and \B work with default Unicode word breaks
                           and make ".", "^" and "$" work with Unicode line
                           breaks.
-    X   x   VERBOSE       Ignore whitespace and comments for nicer looking REs.
+    X   x   VERBOSE       Ignore whitespace and comments for nicer looking REs
+                          outside of sets.
+    XX  X   FULLVERBOSE   Ignore whitespace and comments for nicer looking REs.
 
 This module also defines an exception 'error'.
 
@@ -238,8 +240,8 @@ __all__ = ["cache_all", "compile", "DEFAULT_VERSION", "escape", "findall",
   "BESTMATCH", "D", "DEBUG", "E", "ENHANCEMATCH", "S", "DOTALL", "F",
   "FULLCASE", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "P", "POSIX",
   "R", "REVERSE", "T", "TEMPLATE", "U", "UNICODE", "V0", "VERSION0", "V1",
-  "VERSION1", "X", "VERBOSE", "W", "WORD", "error", "Regex", "__version__",
-  "__doc__", "RegexFlag"]
+  "VERSION1", "X", "VERBOSE", "XX", "FULLVERBOSE", "W", "WORD", "error",
+  "Regex", "__version__", "__doc__", "RegexFlag"]
 
 __version__ = "2.5.141"
 
@@ -732,6 +734,11 @@ del _pat
 # Make Pattern public for typing annotations.
 __all__.append("Pattern")
 __all__.append("Match")
+
+def get_properties():
+    return _regex.get_properties()
+
+__all__.append("get_properties")
 
 # We'll define an alias for the 'compile' function so that the repr of a
 # pattern object is eval-able.

@@ -22598,6 +22598,7 @@ static RE_FlagName flag_names[] = {
     {"R", RE_FLAG_REVERSE},
     {"T", RE_FLAG_TEMPLATE},
     {"X", RE_FLAG_VERBOSE},
+    {"XX", RE_FLAG_FULLVERBOSE},
     {"V0", RE_FLAG_VERSION0},
     {"V1", RE_FLAG_VERSION1},
     {"W", RE_FLAG_WORD},
