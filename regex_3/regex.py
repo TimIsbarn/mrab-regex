@@ -206,12 +206,14 @@ these flags can also be set within an RE:
                           fuzzy match.
     F   f   FULLCASE      Use full case-folding when performing
                           case-insensitive matching in Unicode.
+    H   h   HALT_TIME     Pause timeout while executing embedded code.
     I   i   IGNORECASE    Perform case-insensitive matching.
     L   L   LOCALE        Make \w, \W, \b, \B, \d, and \D dependent on the
                           current locale. (One byte per character only.)
     M   m   MULTILINE     "^" matches the beginning of lines (after a newline)
                           as well as the string. "$" matches the end of lines
                           (before a newline) as well as the end of the string.
+    N   n   NO_CODE       Suppresses all embedded code.
     P   p   POSIX         Perform POSIX-standard matching (leftmost longest).
     R   r   REVERSE       Searches backwards.
     S   s   DOTALL        "." matches any character at all, including the
@@ -227,7 +229,7 @@ these flags can also be set within an RE:
                           breaks.
     X   x   VERBOSE       Ignore whitespace and comments for nicer looking REs
                           outside of sets.
-    XX  X   FULLVERBOSE   Ignore whitespace and comments for nicer looking REs.
+    Y   y   FULLVERBOSE   Ignore whitespace and comments for nicer looking REs.
 
 This module also defines an exception 'error'.
 
@@ -238,10 +240,10 @@ __all__ = ["cache_all", "compile", "DEFAULT_VERSION", "escape", "findall",
   "finditer", "fullmatch", "match", "purge", "search", "split", "splititer",
   "sub", "subf", "subfn", "subn", "template", "Scanner", "A", "ASCII", "B",
   "BESTMATCH", "D", "DEBUG", "E", "ENHANCEMATCH", "S", "DOTALL", "F",
-  "FULLCASE", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "P", "POSIX",
+  "FULLCASE", "H", "HALT_TIME", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P", "POSIX",
   "R", "REVERSE", "T", "TEMPLATE", "U", "UNICODE", "V0", "VERSION0", "V1",
-  "VERSION1", "X", "VERBOSE", "XX", "FULLVERBOSE", "W", "WORD", "error",
-  "Regex", "__version__", "__doc__", "RegexFlag"]
+  "VERSION1", "X", "VERBOSE", "Y", "FULLVERBOSE", "W", "WORD", "error",
+  "Regex", "__version__", "__doc__", "RegexFlag", "state"]
 
 __version__ = "2.5.141"
 
@@ -249,48 +251,59 @@ __version__ = "2.5.141"
 # Public interface.
 
 def match(pattern, string, flags=0, pos=None, endpos=None, partial=False,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Try to apply the pattern at the start of the string, returning a match
     object, or None if no match was found."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.match(string, pos, endpos, concurrent, partial, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.match(string, pos, endpos, concurrent, partial, timeout, globals,
+      locals)
 
 def fullmatch(pattern, string, flags=0, pos=None, endpos=None, partial=False,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Try to apply the pattern against all of the string, returning a match
     object, or None if no match was found."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.fullmatch(string, pos, endpos, concurrent, partial, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.fullmatch(string, pos, endpos, concurrent, partial, timeout,
+      globals, locals)
 
 def search(pattern, string, flags=0, pos=None, endpos=None, partial=False,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Search through string looking for a match to the pattern, returning a
     match object, or None if no match was found."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.search(string, pos, endpos, concurrent, partial, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.search(string, pos, endpos, concurrent, partial, timeout,
+      globals, locals)
 
 def sub(pattern, repl, string, count=0, flags=0, pos=None, endpos=None,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Return the string obtained by replacing the leftmost (or rightmost with a
     reverse pattern) non-overlapping occurrences of the pattern in string by the
     replacement repl. repl can be either a string or a callable; if a string,
     backslash escapes in it are processed; if a callable, it's passed the match
     object and must return a replacement string to be used."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.sub(repl, string, count, pos, endpos, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.sub(repl, string, count, pos, endpos, concurrent, timeout,
+      globals, locals)
 
 def subf(pattern, format, string, count=0, flags=0, pos=None, endpos=None,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Return the string obtained by replacing the leftmost (or rightmost with a
     reverse pattern) non-overlapping occurrences of the pattern in string by the
     replacement format. format can be either a string or a callable; if a string,
     it's treated as a format string; if a callable, it's passed the match object
     and must return a replacement string to be used."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.subf(format, string, count, pos, endpos, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.subf(format, string, count, pos, endpos, concurrent, timeout,
+      globals, locals)
 
 def subn(pattern, repl, string, count=0, flags=0, pos=None, endpos=None,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Return a 2-tuple containing (new_string, number). new_string is the string
     obtained by replacing the leftmost (or rightmost with a reverse pattern)
     non-overlapping occurrences of the pattern in the source string by the
@@ -298,11 +311,13 @@ def subn(pattern, repl, string, count=0, flags=0, pos=None, endpos=None,
     can be either a string or a callable; if a string, backslash escapes in it
     are processed; if a callable, it's passed the match object and must return a
     replacement string to be used."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.subn(repl, string, count, pos, endpos, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.subn(repl, string, count, pos, endpos, concurrent, timeout,
+      globals, locals)
 
 def subfn(pattern, format, string, count=0, flags=0, pos=None, endpos=None,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Return a 2-tuple containing (new_string, number). new_string is the string
     obtained by replacing the leftmost (or rightmost with a reverse pattern)
     non-overlapping occurrences of the pattern in the source string by the
@@ -310,49 +325,55 @@ def subfn(pattern, format, string, count=0, flags=0, pos=None, endpos=None,
     can be either a string or a callable; if a string, it's treated as a format
     string; if a callable, it's passed the match object and must return a
     replacement string to be used."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.subfn(format, string, count, pos, endpos, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.subfn(format, string, count, pos, endpos, concurrent, timeout,
+      globals, locals)
 
 def split(pattern, string, maxsplit=0, flags=0, concurrent=None, timeout=None,
-  ignore_unused=False, **kwargs):
+  ignore_unused=False, globals=None, locals=None, **kwargs):
     """Split the source string by the occurrences of the pattern, returning a
     list containing the resulting substrings.  If capturing parentheses are used
     in pattern, then the text of all groups in the pattern are also returned as
     part of the resulting list.  If maxsplit is nonzero, at most maxsplit splits
     occur, and the remainder of the string is returned as the final element of
     the list."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.split(string, maxsplit, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.split(string, maxsplit, concurrent, timeout, globals, locals)
 
 def splititer(pattern, string, maxsplit=0, flags=0, concurrent=None,
-  timeout=None, ignore_unused=False, **kwargs):
+  timeout=None, ignore_unused=False, globals=None, locals=None, **kwargs):
     "Return an iterator yielding the parts of a split string."
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.splititer(string, maxsplit, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.splititer(string, maxsplit, concurrent, timeout, globals, locals)
 
 def findall(pattern, string, flags=0, pos=None, endpos=None, overlapped=False,
-  concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  concurrent=None, timeout=None, ignore_unused=False, globals=None, locals=None,
+  **kwargs):
     """Return a list of all matches in the string. The matches may be overlapped
     if overlapped is True. If one or more groups are present in the pattern,
     return a list of groups; this will be a list of tuples if the pattern has
     more than one group. Empty matches are included in the result."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
-    return pat.findall(string, pos, endpos, overlapped, concurrent, timeout)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
+    return pat.findall(string, pos, endpos, overlapped, concurrent, timeout,
+      globals, locals)
 
 def finditer(pattern, string, flags=0, pos=None, endpos=None, overlapped=False,
-  partial=False, concurrent=None, timeout=None, ignore_unused=False, **kwargs):
+  partial=False, concurrent=None, timeout=None, ignore_unused=False,
+  globals=None, locals=None, **kwargs):
     """Return an iterator over all matches in the string. The matches may be
     overlapped if overlapped is True. For each match, the iterator returns a
     match object. Empty matches are included in the result."""
-    pat = _compile(pattern, flags, ignore_unused, kwargs, True)
+    pat = _compile(pattern, flags, ignore_unused, kwargs, True, None, None)
     return pat.finditer(string, pos, endpos, overlapped, concurrent, partial,
-      timeout)
+      timeout, globals, locals)
 
-def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None, **kwargs):
+def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None,
+  globals=None, locals=None, **kwargs):
     "Compile a regular expression pattern, returning a pattern object."
     if cache_pattern is None:
         cache_pattern = _cache_all
-    return _compile(pattern, flags, ignore_unused, kwargs, cache_pattern)
+    return _compile(pattern, flags, ignore_unused, kwargs, cache_pattern,
+      globals, locals)
 
 def purge():
     "Clear the regular expression cache"
@@ -413,19 +434,22 @@ def escape(pattern, special_only=True, literal_spaces=False):
 
     return r
 
+def state():
+    return _regex.state
+
 # --------------------------------------------------------------------
 # Internals.
 
-import regex._regex_core as _regex_core
-import regex._regex as _regex
+import regexd._regex_core as _regex_core
+import regexd._regex as _regex
 from threading import RLock as _RLock
 from locale import getpreferredencoding as _getpreferredencoding
-from regex._regex_core import *
-from regex._regex_core import (_ALL_VERSIONS, _ALL_ENCODINGS, _FirstSetError,
+from regexd._regex_core import *
+from regexd._regex_core import (_ALL_VERSIONS, _ALL_ENCODINGS, _FirstSetError,
   _UnscopedFlagSet, _check_group_features, _compile_firstset,
   _compile_replacement, _flatten_code, _fold_case, _get_required_string,
   _parse_pattern, _shrink_cache)
-from regex._regex_core import (ALNUM as _ALNUM, Info as _Info, OP as _OP, Source
+from regexd._regex_core import (ALNUM as _ALNUM, Info as _Info, OP as _OP, Source
   as _Source, Fuzzy as _Fuzzy)
 
 # Version 0 is the old behaviour, compatible with the original 're' module.
@@ -448,7 +472,7 @@ _locale_sensitive = {}
 _MAXCACHE = 500
 _MAXREPCACHE = 500
 
-def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
+def _compile(pattern, flags, ignore_unused, kwargs, cache_it, globals, locals):
     "Compiles a regular expression to a PatternObject."
 
     global DEFAULT_VERSION
@@ -642,6 +666,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
 
     # The named capture groups.
     index_group = dict((v, n) for n, v in info.group_index.items())
+    
+    embedded_code = list(info.code_text.values())
 
     # Create the PatternObject.
     #
@@ -650,7 +676,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it):
     # affect the code generation but _are_ needed by the PatternObject.
     compiled_pattern = _regex.compile(pattern, info.flags | version, code,
       info.group_index, index_group, named_lists, named_list_indexes,
-      req_offset, req_chars, req_flags, info.group_count)
+      req_offset, req_chars, req_flags, info.group_count, embedded_code,
+      globals, locals)
 
     # Do we need to reduce the size of the cache?
     if len(_cache) >= _MAXCACHE:
@@ -726,7 +753,7 @@ def _compile_replacement_helper(pattern, template):
     return compiled
 
 # We define Pattern here after all the support objects have been defined.
-_pat = _compile('', 0, False, {}, False)
+_pat = _compile('', 0, False, {}, False, None, None)
 Pattern = type(_pat)
 Match = type(_pat.match(''))
 del _pat

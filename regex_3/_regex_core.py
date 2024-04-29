@@ -15,15 +15,17 @@
 
 import enum
 import string
+import traceback
+
 import unicodedata
 from collections import defaultdict
 
-import regex._regex as _regex
+import regexd._regex as _regex
 
 __all__ = ["A", "ASCII", "B", "BESTMATCH", "D", "DEBUG", "E", "ENHANCEMATCH",
-  "F", "FULLCASE", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "P",
+  "F", "FULLCASE", "H", "HALT_TIME", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P",
   "POSIX", "R", "REVERSE", "S", "DOTALL", "T", "TEMPLATE", "U", "UNICODE",
-  "V0", "VERSION0", "V1", "VERSION1", "W", "WORD", "X", "VERBOSE", "XX",
+  "V0", "VERSION0", "V1", "VERSION1", "W", "WORD", "X", "VERBOSE", "Y",
   "FULLVERBOSE", "error", "Scanner", "RegexFlag"]
 
 # The regex exception.
@@ -71,25 +73,27 @@ class _FirstSetError(Exception):
 
 # Flags.
 class RegexFlag(enum.IntFlag):
-    A = ASCII = 0x80           # Assume ASCII locale.
-    B = BESTMATCH = 0x1000     # Best fuzzy match.
-    D = DEBUG = 0x200          # Print parsed pattern.
-    E = ENHANCEMATCH = 0x8000  # Attempt to improve the fit after finding the first
-                               # fuzzy match.
-    F = FULLCASE = 0x4000      # Unicode full case-folding.
-    I = IGNORECASE = 0x2       # Ignore case.
-    L = LOCALE = 0x4           # Assume current 8-bit locale.
-    M = MULTILINE = 0x8        # Make anchors look for newline.
-    P = POSIX = 0x10000        # POSIX-style matching (leftmost longest).
-    R = REVERSE = 0x400        # Search backwards.
-    S = DOTALL = 0x10          # Make dot match newline.
-    U = UNICODE = 0x20         # Assume Unicode locale.
-    V0 = VERSION0 = 0x2000     # Old legacy behaviour.
-    V1 = VERSION1 = 0x100      # New enhanced behaviour.
-    W = WORD = 0x800           # Default Unicode word breaks.
-    X = VERBOSE = 0x40         # Ignore whitespace and comments outside of sets.
-    XX = FULLVERBOSE = 0x20000 # Ignore whitespace and comments.
-    T = TEMPLATE = 0x1         # Template (present because re module has it).
+    A = ASCII = 0x80          # Assume ASCII locale.
+    B = BESTMATCH = 0x1000    # Best fuzzy match.
+    D = DEBUG = 0x200         # Print parsed pattern.
+    E = ENHANCEMATCH = 0x8000 # Attempt to improve the fit after finding the first
+                              # fuzzy match.
+    F = FULLCASE = 0x4000     # Unicode full case-folding.
+    H = HALT_TIME = 0x80000   # Pause timeout while executing embedded code.
+    I = IGNORECASE = 0x2      # Ignore case.
+    L = LOCALE = 0x4          # Assume current 8-bit locale.
+    M = MULTILINE = 0x8       # Make anchors look for newline.
+    N = NO_CODE = 0x40000     # Skips all embedded code.
+    P = POSIX = 0x10000       # POSIX-style matching (leftmost longest).
+    R = REVERSE = 0x400       # Search backwards.
+    S = DOTALL = 0x10         # Make dot match newline.
+    U = UNICODE = 0x20        # Assume Unicode locale.
+    V0 = VERSION0 = 0x2000    # Old legacy behaviour.
+    V1 = VERSION1 = 0x100     # New enhanced behaviour.
+    W = WORD = 0x800          # Default Unicode word breaks.
+    X = VERBOSE = 0x40        # Ignore whitespace and comments outside of sets.
+    Y = FULLVERBOSE = 0x20000 # Ignore whitespace and comments.
+    T = TEMPLATE = 0x1        # Template (present because re module has it).
 
     def __repr__(self):
         if self._name_ is not None:
@@ -134,13 +138,14 @@ _ALL_VERBOSE = VERBOSE | FULLVERBOSE
 DEFAULT_FLAGS = {VERSION0: 0, VERSION1: FULLCASE}
 
 # The mask for the flags.
-GLOBAL_FLAGS = (_ALL_VERSIONS | BESTMATCH | DEBUG | ENHANCEMATCH | POSIX |
+GLOBAL_FLAGS = (_ALL_VERSIONS | BESTMATCH | DEBUG | ENHANCEMATCH | NO_CODE | POSIX |
   REVERSE)
-SCOPED_FLAGS = (FULLCASE | FULLVERBOSE | IGNORECASE | MULTILINE | DOTALL |
+SCOPED_FLAGS = (FULLCASE | FULLVERBOSE | HALT_TIME | IGNORECASE | MULTILINE | DOTALL |
   WORD | VERBOSE | _ALL_ENCODINGS)
 
 ALPHA = frozenset(string.ascii_letters)
 DIGITS = frozenset(string.digits)
+WHITESPACE = frozenset(string.whitespace)
 ALNUM = ALPHA | DIGITS
 OCT_DIGITS = frozenset(string.octdigits)
 HEX_DIGITS = frozenset(string.hexdigits)
@@ -157,8 +162,8 @@ BITS_PER_CODE = BYTES_PER_CODE * 8
 UNLIMITED = (1 << BITS_PER_CODE) - 1
 
 # The regular expression flags.
-REGEX_FLAGS = {"a": ASCII, "b": BESTMATCH, "e": ENHANCEMATCH, "f": FULLCASE,
-  "i": IGNORECASE, "L": LOCALE, "m": MULTILINE, "p": POSIX, "r": REVERSE,
+REGEX_FLAGS = {"a": ASCII, "b": BESTMATCH, "e": ENHANCEMATCH, "f": FULLCASE, "h": HALT_TIME,
+  "i": IGNORECASE, "L": LOCALE, "m": MULTILINE, "n": NO_CODE, "p": POSIX, "r": REVERSE,
   "s": DOTALL, "u": UNICODE, "V0": VERSION0, "V1": VERSION1, "w": WORD, "x":
   VERBOSE, "X": FULLVERBOSE}
 
@@ -197,6 +202,7 @@ CONDITIONAL
 DEFAULT_BOUNDARY
 DEFAULT_END_OF_WORD
 DEFAULT_START_OF_WORD
+EMBEDDED_CODE
 END
 END_OF_LINE
 END_OF_LINE_U
@@ -857,16 +863,27 @@ def parse_paren(source, info):
         if ch in "+-":
             version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
             if version == VERSION1:
-                # (?+...: relative group call
-                offset = parse_offset(source, ch)
-                source.expect(")")
-                return CallGroup(info, None, offset, saved_pos_2)
+                # (?+... or (?-...: relative group call
+                saved_pos = source.pos
+                saved_flags = info.flags
+                try:
+                    offset = parse_offset(source, ch)
+                    source.expect(")")
+                    return CallGroup(info, None, offset, saved_pos_2)
+                except error:
+                    info.flags = saved_flags
+                    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
+                    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+                    source.pos = saved_pos
         if ch == "R" or "0" <= ch <= "9":
             # (?R...: probably a call to a group.
             return parse_call_group(source, info, ch, saved_pos_2)
         if ch == "&":
             # (?&...: a call to a named group.
             return parse_call_named_group(source, info, saved_pos_2)
+        if ch == "{":
+            # (?{...: embedded code.
+            return parse_embedded_code(source, info)
 
         # (?...: probably a flags subpattern.
         source.pos = saved_pos_2
@@ -1101,6 +1118,79 @@ def parse_call_named_group(source, info, pos):
     source.expect(")")
 
     return CallGroup(info, group, offset, pos)
+
+def parse_embedded_code(source, info):
+    "Parses embedded code."
+    
+    prefix = ""
+    start_pos = source.pos
+    if source.ignore_space:
+        ws = set(WHITESPACE)
+        ws.remove("\n")
+        source.ignore_space = False
+        prefix = source.get_while(ws)
+        while source.match("\n"):
+            start_pos = source.pos
+            prefix = source.get_while(ws)
+        source.ignore_space = True
+    l = len(prefix)
+    
+    text = source.string[start_pos:]
+    lines = text.splitlines(True)
+    new_lines = []
+    removed_prefixes = []
+    for idx, line in enumerate(lines):
+        if line.isspace():
+            continue
+        nl = line.removeprefix(prefix)
+        new_lines.append(nl)
+        removed_prefixes.append(nl is not line)
+    text = "".join(new_lines)
+    
+    def align_source_pos():
+        pos = start_pos + e.offset
+        for i in range(e.lineno - 1):
+            pos += len(new_lines[i])
+            if removed_prefixes[i]:
+                pos += l
+        if removed_prefixes[e.lineno - 1]:
+            pos += l
+        
+        source.pos = pos
+    
+    try:
+        # The position of the first error terminates the embedded code.
+        compile(text, "_regex_core.py", "exec")
+        # Guaranteed to fail, as either the entire string is consumed,
+        # or the embedded code or the regex is invalid.
+        source.expect("})")
+    except IndentationError as e:
+        align_source_pos()
+    except SyntaxError as e:
+        align_source_pos()
+        source.pos -= 1
+    
+    end_pos = source.pos
+    text = source.string[start_pos:end_pos]
+    
+    if source.ignore_space:
+        lines = text.splitlines(True)
+        new_lines = []
+        for line in lines:
+            new_lines.append(line.removeprefix(prefix))
+        text = "".join(new_lines).rstrip()
+    
+    source.expect("})")
+    
+    if info.flags & NO_CODE:
+        return Sequence()
+    
+    code = info.code(text)
+    
+    if code < 0:
+        return Sequence()
+    
+    return EmbeddedCode(code, bool(info.flags & HALT_TIME))
 
 def parse_flag_set(source):
     "Parses a set of inline flags."
@@ -2763,6 +2853,27 @@ class DefaultEndOfWord(ZeroWidthBase):
 class DefaultStartOfWord(ZeroWidthBase):
     _opcode = OP.DEFAULT_START_OF_WORD
     _op_name = "DEFAULT_START_OF_WORD"
+    
+class EmbeddedCode(RegexBase):
+    def __init__(self, code, halt_time):
+        RegexBase.__init__(self)
+        self.code = code
+        self.halt_time = halt_time
+        
+        self._key = self.__class__, self.code, self.halt_time
+        
+    def get_firstset(self, reverse):
+        return {None}
+    
+    def _compile(self, reverse, fuzzy):
+        return [(OP.EMBEDDED_CODE, self.code, int(self.halt_time))]
+    
+    def dump(self, indent, reverse):
+        mode = {True: "HALT", False: "CONTINUE"}
+        print("{}EMBEDDED_CODE {} {}".format(INDENT * indent, self.code, mode[self.halt_time]))
+    
+    def max_width(self):
+        return 0
 
 class EndOfLine(ZeroWidthBase):
     _opcode = OP.END_OF_LINE
@@ -4345,6 +4456,10 @@ class Info:
         self.inline_locale = False
 
         self.kwargs = kwargs
+        
+        self.code_count = 0
+        self.code_index = {}
+        self.code_text = {}
 
         self.group_count = 0
         self.group_index = {}
@@ -4356,6 +4471,19 @@ class Info:
         self.defined_groups = {}
         self.group_calls = []
         self.private_groups = {}
+        
+    def code(self, code):
+        if code.isspace():
+            return -1
+        
+        index = self.code_index.get(code)
+        if index is None:
+            index = self.code_count
+            self.code_count += 1
+            self.code_index[code] = index
+            self.code_text[index] = code
+            
+        return index
 
     def open_group(self, name=None):
         group = self.group_index.get(name)
