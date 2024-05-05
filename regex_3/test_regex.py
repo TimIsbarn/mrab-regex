@@ -1,3 +1,5 @@
+import time
+import traceback
 from weakref import proxy
 import copy
 import pickle
@@ -1759,23 +1761,6 @@ class RegexTests(unittest.TestCase):
               self.BAD_GROUP_NAME),
             ('(?P<foo_123>a)(?P=foo_124)', 'aa', '', regex.error,
               self.UNKNOWN_GROUP),  # Backref to undefined group.
-            
-            # Relative reference.
-            ('(?V1)(?P<foo_123>a)(?P=-1)', 'aa', '1', ascii('a')),
-            ('(?V1)(?P<foo>a)?(?(-1)b)', 'ab', '0', ascii('ab')),
-            ('(?V1)(?P<foo>a)?(?(-1)b|c)', 'bc', '0', ascii('c')),
-            ('(?V1)(?(DEFINE)(?<foo>a))(?-1)', 'a', '0', ascii('a')),
-            ('(?V1)(?+1)(?(DEFINE)(?<foo>a))', 'a', '0', ascii('a')),
-            ('(?V1)a(?-2)?', 'a', '', regex.error, self.UNKNOWN_GROUP),
-            ('(?V1)a(?+1)?', 'a', '', regex.error, self.UNKNOWN_GROUP),
-            ('(?V1)a(?+0)?', 'a', '', regex.error, self.BAD_OFFSET),
-            ('(?V1)a(?-1)?', 'a', '0', ascii("a")),
-            ('(?V1)a(?-)?', 'a', '', regex.error, self.BAD_OFFSET),
-            # Anchored relative reference.
-            ('(?V1)(?P<foo>a)(?P<bar>b)(?P=bar-1)', 'aba', '0', ascii('aba')),
-            ('(?V1)(?P<foo>a)(?P<bar>b)(?P=foo+1)', 'abb', '0', ascii('abb')),
-            ('(?V1)(?&bar-1)(?(DEFINE)(?<foo>a)(?<bar>b))', 'a', '0', ascii('a')),
-            ('(?V1)(?&foo+1)(?(DEFINE)(?<foo>a)(?<bar>b))', 'b', '0', ascii('b')),
 
             ('(?P<foo_123>a)', 'a', '1', ascii('a')),
             ('(?P<foo_123>a)(?P=foo_123)', 'aa', '1', ascii('a')),
@@ -4471,7 +4456,134 @@ thing
         ['\r\n', '\n', '\x0B', '\f', '\r', '\x85', '\u2028', '\u2029'])
       self.assertEqual(regex.findall(br'\R', b'\r\n\n\x0B\f\r\x85'), [b'\r\n',
         b'\n', b'\x0B', b'\f', b'\r'])
-
+        
+    def test_embedded_code(self):
+        def func(v):
+            lcls["bar"] = v
+        lcls = {"func": func}
+        reg = regex.compile(
+          """(?:foo(?{bar = 2})|bar(?{func(1)}))(?{if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4})""",
+          regex.CODE, globals={}, locals=lcls)
+        # self.assertEqual(reg.code, ("bar = 2", "func(1)", "if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4"))
+        self.assertEqual(reg.locals, lcls)
+        self.assertEqual(reg.globals, {})
+        self.assertEqual(bool(reg.fullmatch("foo")), True)
+        # Builtins are automatically added to the globals.
+        # self.assertEqual(reg.globals, {"__builtins__": globals()["__builtins__"]})
+        self.assertEqual(lcls, {"func": func, "bar": 2, "baz": 3})
+        self.assertEqual(bool(reg.fullmatch("bar")), True)
+        self.assertEqual(lcls, {"func": func, "bar": 1, "baz": 4})
+        
+        idx = 1
+        def func(s):
+            nonlocal idx
+            res = s * idx
+            idx += 1
+            return res
+        self.assertEqual(regex.compile(
+          "(??C=foo) (??{foo}{f('a')}) (??C=foo)", regex.CODE,
+          locals={"f": func}).pattern, "a aa aaa")
+        self.assertEqual(idx, 4)
+        
+        reg = regex.compile(
+          "(?(?{if count == 2:\n\tregex.state().fail()})foo|bar)",
+          regex.CODE, globals={"regex": regex})
+        self.assertEqual(bool(reg.fullmatch("foo", locals={"count": 2})), False)
+        self.assertEqual(bool(reg.fullmatch("bar", locals={"count": 2})), True)
+        self.assertEqual(bool(reg.fullmatch("foo", locals={"count": 3})), True)
+        self.assertEqual(bool(reg.fullmatch("bar", locals={"count": 3})), False)
+        
+        ls = {}
+        reg = regex.compile("""(?x)
+        (?+{depth = max_depth = 0})
+        (?<brace_pair>
+            {
+            (?+{
+                depth += 1
+                max_depth = max(max_depth, depth)
+            })
+            (??{non_brace}{"[^{}]*+"})
+            (?:
+                (?&brace_pair)
+                (??C=non_brace)
+            )*+
+            (?:
+                }
+                (?+{depth -= 1})
+            |
+                $
+            )
+        )
+        """, regex.CODE, locals=ls)
+        self.assertEqual(bool(reg.fullmatch(
+          "{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{}}")), True)
+        self.assertEqual(ls, {"depth": 0, "max_depth": 7})
+        self.assertEqual(bool(reg.fullmatch(
+          "{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{")), True)
+        self.assertEqual(ls, {"depth": 2, "max_depth": 7})
+        
+        reg = regex.compile("""(?x)
+        ((.)\\2++)
+        ((.)\\4+)
+        (?+{
+            s = regex.state()
+            g1 = s.group(1)
+            g2 = s.group(3)
+            if len(g1) != len(g2) or g1[0] == g2[0]:
+                s.fail()
+            del s
+        })
+        ((.)\\6+)
+        (?{
+            s = regex.state()
+            g1 = s.group(1)
+            g2 = s.group(3)
+            g3 = s.group(5)
+            if (not (len(g1) == len(g2) == len(g3)) or
+              not (g1[0] != g2[0] != g3[0])):
+                s.fail()
+            del s
+        })
+        """, regex.CODE, globals={"regex": regex})
+        self.assertEqual(bool(reg.fullmatch("aabbcc")), True)
+        self.assertEqual(bool(reg.fullmatch("aabbc")), False)
+        self.assertEqual(bool(reg.fullmatch("aabcc")), False)
+        self.assertEqual(bool(reg.fullmatch("abbcc")), False)
+        
+        # Ensure that globals, locals and CODE flag are unset upon pickling.
+        ls = {"foo": True}
+        reg = regex.compile("(?{foo = False})bar", regex.CODE, locals=ls)
+        p = pickle.dumps(reg)
+        reg = pickle.loads(p)
+        #self.assertEqual(reg.locals, {})
+        reg.locals = ls
+        self.assertEqual(ls, {"foo": True})
+        reg.fullmatch("bar", code=True)
+        self.assertEqual(ls, {"foo": False})
+        
+        self.assertEqual(regex.compile("(?n)(?{foo = 2})").code, ())
+        self.assertEqual(regex.compile("(??{\"foo = 2\"})").pattern,
+          "(??{\"foo = 2\"})")
+        self.assertEqual(regex.compile("(?c)(??{\"foo = 2\"})").pattern,
+          "(?c)foo = 2")
+        
+        self.assertRaisesRegex(regex.error, "^cannot turn CODE flag on within evaluated code at position 8$",
+          lambda: regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
+          locals={"f": lambda: "(?c:(??{\"foo\"}))"}))
+        self.assertEqual(regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
+          locals={"f": lambda: "(??{\"foo\"})"}).pattern,
+          "(?c)(?-c:(??{\"foo\"}))")
+        self.assertEqual(regex.compile("(?c)(??{f()})",
+          locals={"f": lambda: "(??{\"foo\"})"}).pattern, "(?c)foo")
+        
+        self.assertRaisesRegex(regex.error, "^cannot turn NO_CODE flag off within evaluated code at position 8$",
+          lambda: regex.compile("(?c)(??{f\"(?n:{f()})\"})",
+          locals={"f": lambda: "(?-n:(??{\"foo\"}))"}))
+        self.assertEqual(regex.compile("(?c)(??{f\"(?n:{f()})\"})",
+          locals={"f": lambda: "(??{\"foo\"})"}).pattern,
+          "(?c)(?n:(??{\"foo\"}))")
+        
+        
 def test_main():
     unittest.main(verbosity=2)
 

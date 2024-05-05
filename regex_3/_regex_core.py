@@ -14,19 +14,20 @@
 # 2010-01-16 mrab Python front-end re-written and extended
 
 import enum
+import inspect
 import string
 import traceback
 
 import unicodedata
 from collections import defaultdict
 
-import regexd._regex as _regex
+import regex._regex as _regex
 
-__all__ = ["A", "ASCII", "B", "BESTMATCH", "D", "DEBUG", "E", "ENHANCEMATCH",
-  "F", "FULLCASE", "H", "HALT_TIME", "I", "IGNORECASE", "L", "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P",
-  "POSIX", "R", "REVERSE", "S", "DOTALL", "T", "TEMPLATE", "U", "UNICODE",
-  "V0", "VERSION0", "V1", "VERSION1", "W", "WORD", "X", "VERBOSE", "Y",
-  "FULLVERBOSE", "error", "Scanner", "RegexFlag"]
+__all__ = ["A", "ASCII", "B", "BESTMATCH", "C", "CODE", "D", "DEBUG", "E",
+  "ENHANCEMATCH", "F", "FULLCASE", "H", "HALT_TIMER", "I", "IGNORECASE", "L",
+  "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P", "POSIX", "R", "REVERSE", "S",
+  "DOTALL", "T", "TEMPLATE", "U", "UNICODE", "V0", "VERSION0", "V1", "VERSION1",
+  "W", "WORD", "X", "VERBOSE", "error", "Scanner", "RegexFlag"]
 
 # The regex exception.
 class error(Exception):
@@ -75,15 +76,16 @@ class _FirstSetError(Exception):
 class RegexFlag(enum.IntFlag):
     A = ASCII = 0x80          # Assume ASCII locale.
     B = BESTMATCH = 0x1000    # Best fuzzy match.
+    C = CODE = 0x20000        # Execute/Evaluate code.
     D = DEBUG = 0x200         # Print parsed pattern.
     E = ENHANCEMATCH = 0x8000 # Attempt to improve the fit after finding the first
                               # fuzzy match.
     F = FULLCASE = 0x4000     # Unicode full case-folding.
-    H = HALT_TIME = 0x80000   # Pause timeout while executing embedded code.
+    H = HALT_TIMER = 0x40000  # Pauses the timeout while executing code.
     I = IGNORECASE = 0x2      # Ignore case.
     L = LOCALE = 0x4          # Assume current 8-bit locale.
     M = MULTILINE = 0x8       # Make anchors look for newline.
-    N = NO_CODE = 0x40000     # Skips all embedded code.
+    N = NO_CODE = 0x80000     # Ignore all code.
     P = POSIX = 0x10000       # POSIX-style matching (leftmost longest).
     R = REVERSE = 0x400       # Search backwards.
     S = DOTALL = 0x10         # Make dot match newline.
@@ -91,8 +93,7 @@ class RegexFlag(enum.IntFlag):
     V0 = VERSION0 = 0x2000    # Old legacy behaviour.
     V1 = VERSION1 = 0x100     # New enhanced behaviour.
     W = WORD = 0x800          # Default Unicode word breaks.
-    X = VERBOSE = 0x40        # Ignore whitespace and comments outside of sets.
-    Y = FULLVERBOSE = 0x20000 # Ignore whitespace and comments.
+    X = VERBOSE = 0x40        # Ignore whitespace and comments.
     T = TEMPLATE = 0x1        # Template (present because re module has it).
 
     def __repr__(self):
@@ -132,20 +133,19 @@ DEFAULT_VERSION = VERSION1
 
 _ALL_VERSIONS = VERSION0 | VERSION1
 _ALL_ENCODINGS = ASCII | LOCALE | UNICODE
-_ALL_VERBOSE = VERBOSE | FULLVERBOSE
 
 # The default flags for the various versions.
 DEFAULT_FLAGS = {VERSION0: 0, VERSION1: FULLCASE}
 
 # The mask for the flags.
-GLOBAL_FLAGS = (_ALL_VERSIONS | BESTMATCH | DEBUG | ENHANCEMATCH | NO_CODE | POSIX |
+GLOBAL_FLAGS = (_ALL_VERSIONS | BESTMATCH | DEBUG | ENHANCEMATCH | POSIX |
   REVERSE)
-SCOPED_FLAGS = (FULLCASE | FULLVERBOSE | HALT_TIME | IGNORECASE | MULTILINE | DOTALL |
-  WORD | VERBOSE | _ALL_ENCODINGS)
+SCOPED_FLAGS = (CODE | FULLCASE | HALT_TIMER | IGNORECASE | MULTILINE |
+  NO_CODE | DOTALL | WORD | VERBOSE | _ALL_ENCODINGS)
 
+WHITESPACE = frozenset(string.whitespace)
 ALPHA = frozenset(string.ascii_letters)
 DIGITS = frozenset(string.digits)
-WHITESPACE = frozenset(string.whitespace)
 ALNUM = ALPHA | DIGITS
 OCT_DIGITS = frozenset(string.octdigits)
 HEX_DIGITS = frozenset(string.hexdigits)
@@ -162,10 +162,10 @@ BITS_PER_CODE = BYTES_PER_CODE * 8
 UNLIMITED = (1 << BITS_PER_CODE) - 1
 
 # The regular expression flags.
-REGEX_FLAGS = {"a": ASCII, "b": BESTMATCH, "e": ENHANCEMATCH, "f": FULLCASE, "h": HALT_TIME,
-  "i": IGNORECASE, "L": LOCALE, "m": MULTILINE, "n": NO_CODE, "p": POSIX, "r": REVERSE,
-  "s": DOTALL, "u": UNICODE, "V0": VERSION0, "V1": VERSION1, "w": WORD, "x":
-  VERBOSE, "X": FULLVERBOSE}
+REGEX_FLAGS = {"a": ASCII, "b": BESTMATCH, "c": CODE, "e": ENHANCEMATCH, "f":
+  FULLCASE, "h": HALT_TIMER, "i": IGNORECASE, "L": LOCALE, "m": MULTILINE, "n":
+  NO_CODE, "p": POSIX, "r": REVERSE, "s": DOTALL, "u": UNICODE, "V0": VERSION0,
+  "V1": VERSION1, "w": WORD, "x": VERBOSE}
 
 # The case flags.
 CASE_FLAGS = FULLCASE | IGNORECASE
@@ -202,7 +202,6 @@ CONDITIONAL
 DEFAULT_BOUNDARY
 DEFAULT_END_OF_WORD
 DEFAULT_START_OF_WORD
-EMBEDDED_CODE
 END
 END_OF_LINE
 END_OF_LINE_U
@@ -210,6 +209,10 @@ END_OF_STRING
 END_OF_STRING_LINE
 END_OF_STRING_LINE_U
 END_OF_WORD
+EXEC_CODE
+EXEC_CODE_ADV
+EXEC_CODE_REV
+EXEC_CODE_CONDITIONAL
 FUZZY
 GRAPHEME_BOUNDARY
 GREEDY_REPEAT
@@ -314,8 +317,8 @@ def _shrink_cache(cache_dict, args_dict, locale_sensitive, max_length, divisor=5
     # Rebuild the arguments and locale-sensitivity dictionaries.
     args_dict.clear()
     sensitivity_dict = {}
-    for pattern, pattern_type, flags, args, default_version, locale in tuple(cache_dict):
-        args_dict[pattern, pattern_type, flags, default_version, locale] = args
+    for pattern, pattern_type, flags, args, default_version, locale, global_keys, local_keys in tuple(cache_dict):
+        args_dict[pattern, pattern_type, flags, default_version, locale, global_keys, local_keys] = args
         try:
             sensitivity_dict[pattern_type, pattern] = locale_sensitive[pattern_type, pattern]
         except KeyError:
@@ -407,9 +410,9 @@ def make_character(info, value, in_set=False):
 
     return Character(value, case_flags=make_case_flags(info))
 
-def make_ref_group(info, name, offset, position):
+def make_ref_group(info, name, position):
     "Makes a group reference."
-    return RefGroup(info, name, offset, position, case_flags=make_case_flags(info))
+    return RefGroup(info, name, position, case_flags=make_case_flags(info))
 
 def make_string_set(info, name):
     "Makes a string set."
@@ -813,6 +816,7 @@ def parse_paren(source, info):
     inline flag.
     """
     saved_pos = source.pos
+    start_pos = saved_pos - 1
     ch = source.get(True)
     if ch == "?":
         # (?...
@@ -837,8 +841,7 @@ def parse_paren(source, info):
                 source.expect(")")
             finally:
                 info.flags = saved_flags
-                source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-                source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+                source.ignore_space = bool(info.flags & VERBOSE)
 
             info.close_group()
             return Group(info, group, subpattern)
@@ -860,21 +863,6 @@ def parse_paren(source, info):
         if ch == "|":
             # (?|...: a common/reset groups branch.
             return parse_common(source, info)
-        if ch in "+-":
-            version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
-            if version == VERSION1:
-                # (?+... or (?-...: relative group call
-                saved_pos = source.pos
-                saved_flags = info.flags
-                try:
-                    offset = parse_offset(source, ch)
-                    source.expect(")")
-                    return CallGroup(info, None, offset, saved_pos_2)
-                except error:
-                    info.flags = saved_flags
-                    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-                    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
-                    source.pos = saved_pos
         if ch == "R" or "0" <= ch <= "9":
             # (?R...: probably a call to a group.
             return parse_call_group(source, info, ch, saved_pos_2)
@@ -882,8 +870,35 @@ def parse_paren(source, info):
             # (?&...: a call to a named group.
             return parse_call_named_group(source, info, saved_pos_2)
         if ch == "{":
-            # (?{...: embedded code.
+            # (?{...: embedded python code.
             return parse_embedded_code(source, info)
+        if ch == "+" and source.match("{"):
+            # (?+{...: advancing code.
+            return parse_embedded_code(source, info, backtrack=False)
+        if ch == "-" and source.match("{"):
+            # (?-{...: backtracking code.
+            return parse_embedded_code(source, info, False)
+        if ch == "C":
+            saved_pos_3 = source.pos
+            ch = source.get()
+            if ch == "=":
+                # (?C=...: code reference.
+                return parse_embedded_code_ref(source, info)
+            if ch == "+":
+                # (?C+...: advancing code reference.
+                return parse_embedded_code_ref(source, info, backtrack=False)
+            if ch == "-":
+                # (?C-...: backtracking code reference.
+                return parse_embedded_code_ref(source, info, False)
+            source.pos = saved_pos_3
+        if ch == "?":
+            ch = source.get()
+            if ch == "{":
+                # (??{...: evaluated code.
+                return parse_embedded_code_eval(source, info, start_pos)
+            if ch == "C" and source.match("="):
+                # (??C=...: evaluated code reference.
+                return parse_embedded_code_ref_eval(source, info, start_pos)
 
         # (?...: probably a flags subpattern.
         source.pos = saved_pos_2
@@ -911,8 +926,7 @@ def parse_paren(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     info.close_group()
 
@@ -933,28 +947,20 @@ def parse_extension(source, info):
             source.expect(")")
         finally:
             info.flags = saved_flags
-            source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-            source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+            source.ignore_space = bool(info.flags & VERBOSE)
 
         info.close_group()
 
         return Group(info, group, subpattern)
     if ch == "=":
         # (?P=...: a named group reference.
-        version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
-        if version == VERSION1:
-            name = parse_name(source, allow_numeric=True, allow_offset=True,
-              allow_empty=True)
-            offset = parse_offset(source, allow_empty=bool(name))
-        else:
-            name = parse_name(source, allow_numeric=True)
-            offset = None
+        name = parse_name(source, allow_numeric=True)
         source.expect(")")
-        if name and info.is_open_group(name):
+        if info.is_open_group(name):
             raise error("cannot refer to an open group", source.string,
               saved_pos)
 
-        return make_ref_group(info, name, offset, saved_pos)
+        return make_ref_group(info, name, saved_pos)
     if ch == ">" or ch == "&":
         # (?P>...: a call to a group.
         return parse_call_named_group(source, info, saved_pos)
@@ -987,8 +993,7 @@ def parse_lookaround(source, info, behind, positive):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     return LookAround(behind, positive, subpattern)
 
@@ -1010,6 +1015,12 @@ def parse_conditional(source, info):
                 # (?(?<=... or (?(?<!...: lookbehind conditional.
                 return parse_lookaround_conditional(source, info, True, ch ==
                   "=")
+        if ch == "{":
+            # (?(?{...
+            return parse_code_conditional(source, info)
+        if ch == "C" and source.match("="):
+            # (?(?C=...
+            return parse_code_conditional_ref(source, info)
 
         source.pos = saved_pos
         raise error("expected lookaround conditional", source.string,
@@ -1017,14 +1028,7 @@ def parse_conditional(source, info):
 
     source.pos = saved_pos
     try:
-        version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
-        if version == VERSION1:
-            group = parse_name(source, allow_numeric=True, allow_offset=True,
-              allow_empty=True)
-            offset = parse_offset(source, allow_empty=bool(group))
-        else:
-            group = parse_name(source, allow_numeric=True)
-            offset = None
+        group = parse_name(source, True)
         source.expect(")")
         yes_branch = parse_sequence(source, info)
         if source.match("|"):
@@ -1035,13 +1039,12 @@ def parse_conditional(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     if yes_branch.is_empty() and no_branch.is_empty():
         return Sequence()
 
-    return Conditional(info, group, offset, yes_branch, no_branch, saved_pos)
+    return Conditional(info, group, yes_branch, no_branch, saved_pos)
 
 def parse_lookaround_conditional(source, info, behind, positive):
     saved_flags = info.flags
@@ -1050,8 +1053,7 @@ def parse_lookaround_conditional(source, info, behind, positive):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     yes_branch = parse_sequence(source, info)
     if source.match("|"):
@@ -1072,8 +1074,7 @@ def parse_atomic(source, info):
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     return Atomic(subpattern)
 
@@ -1104,93 +1105,371 @@ def parse_call_group(source, info, ch, pos):
 
     source.expect(")")
 
-    return CallGroup(info, group, None, pos)
+    return CallGroup(info, group, pos)
 
 def parse_call_named_group(source, info, pos):
     "Parses a call to a named group."
-    version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
-    if version == VERSION1:
-        group = parse_name(source, allow_offset=True)
-        offset = parse_offset(source, allow_empty=True)
-    else:
-        group = parse_name(source)
-        offset = None
+    group = parse_name(source)
     source.expect(")")
 
-    return CallGroup(info, group, offset, pos)
+    return CallGroup(info, group, pos)
 
-def parse_embedded_code(source, info):
-    "Parses embedded code."
-    
+def parse_code(source):
+    "Parses python code."
     prefix = ""
-    start_pos = source.pos
+
     if source.ignore_space:
         ws = set(WHITESPACE)
         ws.remove("\n")
         source.ignore_space = False
-        prefix = source.get_while(ws)
-        while source.match("\n"):
-            start_pos = source.pos
-            prefix = source.get_while(ws)
+        start_pos = None
+
+        first = True
+        while source.match("\n") or first:
+            first = False
+            # The prefix is subtracted from every line of code,
+            # otherwise the parser complains.
+            potential_prefix = source.get_while(ws)
+            if source.match("#"):
+                # Comments can be any indentation.
+                start_pos = source.pos - len(potential_prefix) - 1
+                source.pos = source.string.index("\n", source.pos)
+            else:
+                prefix = potential_prefix
+
+        if start_pos is not None:
+            source.pos = start_pos
         source.ignore_space = True
+
     l = len(prefix)
-    
+    has_prefix = bool(prefix)
+    start_pos = source.pos
     text = source.string[start_pos:]
+
     lines = text.splitlines(True)
-    new_lines = []
-    removed_prefixes = []
-    for idx, line in enumerate(lines):
-        if line.isspace():
-            continue
-        nl = line.removeprefix(prefix)
-        new_lines.append(nl)
-        removed_prefixes.append(nl is not line)
-    text = "".join(new_lines)
-    
+    if has_prefix:
+        new_lines = []
+        removed_prefixes = []
+        break_next = False
+        first = True
+        for idx, line in enumerate(lines):
+            nl = line.removeprefix(prefix)
+            new_lines.append(nl)
+            condition = nl is not line
+            removed_prefixes.append(condition)
+            if break_next:
+                break
+            elif not condition and not first and not line.isspace():
+                try:
+                    # Comments can be any indentation, so exclude them.
+                    substr_idx = line.index("#")
+                    if not line[:substr_idx].isspace():
+                        raise ValueError()
+                except ValueError:
+                    # First non comment line where the prefix couldn't be
+                    # removed, stop after the next line, as the parser will
+                    # complain anyway.
+                    break_next = True
+            first = False
+        lines = new_lines
+        text = "".join(lines)
+
     def align_source_pos():
+        # Assumes an error named e exists.
         pos = start_pos + e.offset
         for i in range(e.lineno - 1):
-            pos += len(new_lines[i])
-            if removed_prefixes[i]:
+            pos += len(lines[i])
+            # Prefixes got removed for compiling, the source still has them
+            if has_prefix and removed_prefixes[i]:
                 pos += l
-        if removed_prefixes[e.lineno - 1]:
+        if has_prefix and removed_prefixes[e.lineno - 1]:
             pos += l
-        
+
         source.pos = pos
-    
+
     try:
-        # The position of the first error terminates the embedded code.
+        # The position of the error terminates the embedded code.
         compile(text, "_regex_core.py", "exec")
-        # Guaranteed to fail, as either the entire string is consumed,
-        # or the embedded code or the regex is invalid.
-        source.expect("})")
+        # compile didn't throw an error therefore the entire string got consumed
+        # and the terminating "}" cannot be present.
+        source.expect("}")
     except IndentationError as e:
+        # e.offset points to the character before "}".
         align_source_pos()
     except SyntaxError as e:
+        # e.offset points to "}", which should be preserved.
         align_source_pos()
         source.pos -= 1
-    
-    end_pos = source.pos
-    text = source.string[start_pos:end_pos]
-    
+
+    text = source.string[start_pos:source.pos]
+
     if source.ignore_space:
-        lines = text.splitlines(True)
-        new_lines = []
-        for line in lines:
-            new_lines.append(line.removeprefix(prefix))
-        text = "".join(new_lines).rstrip()
-    
+        if has_prefix:
+            lines = text.splitlines(True)
+            new_lines = []
+            for line in lines:
+                new_lines.append(line.removeprefix(prefix))
+            text = "".join(new_lines)
+        text = text.rstrip()
+
+    return text
+
+def parse_code_name(source, reference=False):
+    "Parses an embedded code name."
+    saved_pos = source.pos
+    name = source.get_while(set("})"), include=False)
+    if not name.isidentifier() or (not source.match("}{") and not reference):
+        source.pos = saved_pos
+        return None
+
+    return name
+
+def parse_embedded_code(source, info, advance=True, backtrack=True):
+    "Parses embedded python code."
+    name = parse_code_name(source)
+    code = parse_code(source)
     source.expect("})")
-    
+
     if info.flags & NO_CODE:
         return Sequence()
-    
-    code = info.code(text)
-    
-    if code < 0:
+
+    code_id = info.code(code, name)
+
+    if code_id < 0 or (not advance and not backtrack):
         return Sequence()
-    
-    return EmbeddedCode(code, bool(info.flags & HALT_TIME))
+
+    return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER), advance,
+      backtrack)
+
+def parse_embedded_code_eval(source, info, pos):
+    "Parses and evaluates python code."
+    name = parse_code_name(source)
+    code = parse_code(source)
+    source.expect("})")
+
+    if info.flags & NO_CODE:
+        return Sequence()
+
+    code_id = info.code(code, name)
+
+    if code_id < 0 or not (info.flags & CODE):
+        return Sequence()
+
+    if not info.defer_code:
+        return insert_code(source, info, info.flags, code, pos, source.pos)
+
+    return EmbeddedCodeEval(source, info, name, pos, source.pos)
+
+def parse_embedded_code_ref(source, info, advance=True, backtrack=True):
+    "Parses an embedded python code reference."
+    saved_pos = source.pos
+    name = parse_code_name(source, True)
+    source.expect(")")
+
+    if info.flags & NO_CODE:
+        return Sequence()
+
+    code_id = info.get_code_id(name)
+    if code_id is not None:
+        if code_id < 0:
+            return Sequence()
+        return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER), advance,
+          backtrack)
+
+    return EmbeddedCodeRef(info, name, bool(info.flags & HALT_TIMER), advance,
+      backtrack, saved_pos)
+
+def parse_embedded_code_ref_eval(source, info, pos):
+    "Parses and evaluates a python code reference."
+    name = parse_code_name(source, True)
+    source.expect(")")
+
+    if info.flags & NO_CODE or not (info.flags & CODE):
+        return Sequence()
+
+    if not info.defer_code:
+        code_id = info.get_code_id(name)
+        if code_id is not None:
+            if code_id < 0:
+                return Sequence()
+            return insert_code(source, info, info.flags, info.get_code(code_id),
+              pos, source.pos)
+
+    # Ensure evaluation of code from left to right.
+    info.defer_code = True
+    return EmbeddedCodeEval(source, info, name, pos, source.pos)
+
+def parse_code_conditional(source, info):
+    "Parses a code conditional."
+    name = parse_code_name(source)
+    code = parse_code(source)
+    source.expect("})")
+
+    yes_item = None
+    no_item = None
+
+    def parse_items():
+        nonlocal yes_item, no_item
+        saved_flags = info.flags
+        try:
+            yes_item = parse_sequence(source, info)
+            if source.match("|"):
+                no_item = parse_sequence(source, info)
+            else:
+                no_item = Sequence()
+
+            source.expect(")")
+        finally:
+            info.flags = saved_flags
+            source.ignore_space = bool(info.flags & VERBOSE)
+
+    def no_conditional():
+        res = []
+        if not yes_item.is_empty():
+            res.append(yes_item)
+        if not no_item.is_empty():
+            # The no_item is wrapped in a (?(DEFINE)...) group (using index 0
+            # instead, in case DEFINE is a group name) to preserve references.
+            res.append(Conditional(info, "0", no_item, Sequence(),
+              source.pos))
+        return Sequence(res)
+
+    if info.flags & NO_CODE:
+        parse_items()
+        return no_conditional()
+
+    code_id = info.code(code, name)
+
+    parse_items()
+
+    if code_id < 0:
+        return no_conditional()
+
+    if yes_item.is_empty() and no_item.is_empty():
+        return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER),
+          True, False)
+
+    return EmbeddedCodeConditional(code_id, bool(info.flags & HALT_TIMER),
+      yes_item, no_item)
+
+def parse_code_conditional_ref(source, info):
+    "Parses a code conditional using a reference."
+    saved_pos = source.pos
+    name = parse_code_name(source, True)
+    source.expect(")")
+
+    saved_flags = info.flags
+    try:
+        yes_item = parse_sequence(source, info)
+        if source.match("|"):
+            no_item = parse_sequence(source, info)
+        else:
+            no_item = Sequence()
+
+        source.expect(")")
+    finally:
+        info.flags = saved_flags
+        source.ignore_space = bool(info.flags & VERBOSE)
+
+    def no_conditional():
+        res = []
+        if not yes_item.is_empty():
+            res.append(yes_item)
+        if not no_item.is_empty():
+            # The no_item is wrapped in a (?(DEFINE)...) group (using index 0
+            # instead, in case DEFINE is a group name) to preserve references.
+            res.append(Conditional(info, "0", no_item, Sequence(),
+              source.pos))
+        return Sequence(res)
+
+    if info.flags & NO_CODE:
+        return no_conditional()
+
+    code_id = info.get_code_id(name)
+    if code_id is not None:
+        if code_id < 0:
+            return no_conditional()
+
+        if yes_item.is_empty() and no_item.is_empty():
+            return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER), True,
+              False)
+
+        return EmbeddedCodeConditional(code_id, bool(info.flags & HALT_TIMER),
+          yes_item, no_item)
+
+    return EmbeddedCodeRefConditional(info, name, bool(info.flags & HALT_TIMER),
+      yes_item, no_item, saved_pos)
+
+def evaluate_code(source, info, code):
+    "Evaluates python code."
+    result = eval(code, info.globals, info.locals)
+    if not result:
+        return "", True
+
+    t = type(result)
+    if t is str:
+        return result, False
+    elif t is bytes:
+        return result.decode("latin-1"), True
+
+    raise error("evaluated code should return a string or None",
+      source.string, source.pos)
+
+def insert_code(source, info, flags, code, start_pos, end_pos, offset=False):
+    "Evaluates python code and inserts it into the regex string."
+    if offset:
+        # Deferred evaluated code has to adjust it's start and end positions
+        start_pos += info.insertion_offset
+        end_pos += info.insertion_offset
+
+    if start_pos < 0:
+        raise error(f"start pos cannot be negative: {start_pos}",
+          source.string, source.pos)
+    elif start_pos > end_pos:
+        raise error("start pos has to be greater than end pos",
+          source.string, source.pos)
+
+    string, is_bytes = evaluate_code(source, info, code)
+    if not string:
+        return Sequence()
+
+    if (not is_bytes and source.char_type is not chr and
+      bytes(string, "utf-8").decode("latin-1") != string):
+        raise error("cannot insert unicode characters into byte string",
+          source.string, start_pos)
+
+    old_string = source.string
+    ignore_space = source.ignore_space
+    evaluating = info.evaluating
+
+    source.string = string
+    source.pos = 0
+    source.sep = source.string[:0]
+
+    saved_flags = info.flags
+    info.flags = flags
+    info.evaluating = True
+    try:
+        result = _parse_pattern(source, info)
+    finally:
+        info.flags = saved_flags
+        source.ignore_space = bool(info.flags & VERBOSE)
+        info.evaluating = evaluating
+
+    # Insert the new string into the pattern
+    source.string = old_string[:start_pos] + source.string + old_string[end_pos:]
+    source.ignore_space = ignore_space
+    source.sep = source.string[:0]
+    source.modified = True
+
+    if offset:
+        insertion_offset = len(source.string) - len(old_string)
+        info.insertion_offset += insertion_offset
+        source.pos += insertion_offset
+    else:
+        source.pos = start_pos + len(string)
+
+    return result
 
 def parse_flag_set(source):
     "Parses a set of inline flags."
@@ -1229,15 +1508,13 @@ def parse_subpattern(source, info, flags_on, flags_off):
     "Parses a subpattern with scoped flags."
     saved_flags = info.flags
     info.flags = (info.flags | flags_on) & ~flags_off
-    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+    source.ignore_space = bool(info.flags & VERBOSE)
     try:
         subpattern = _parse_pattern(source, info)
         source.expect(")")
     finally:
         info.flags = saved_flags
-        source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-        source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+        source.ignore_space = bool(info.flags & VERBOSE)
 
     return subpattern
 
@@ -1255,6 +1532,16 @@ def parse_flags_subpattern(source, info):
     if flags_on & flags_off:
         raise error("bad inline flags: flag turned on and off", source.string,
           source.pos)
+
+    if info.evaluating:
+        # (??{f"(?-c){...}"}), (??{f"(?n){...}"}) or both to safely insert
+        # arbitrary code without evaluating it.
+        if flags_on & CODE:
+            raise error("cannot turn CODE flag on within evaluated code",
+              source.string, source.pos)
+        if flags_off & NO_CODE: 
+            raise error("cannot turn NO_CODE flag off within evaluated code",
+              source.string, source.pos)
 
     # Handle flags which are global in all regex behaviours.
     new_global_flags = (flags_on & ~info.global_flags) & GLOBAL_FLAGS
@@ -1279,21 +1566,13 @@ def parse_flags_subpattern(source, info):
 def parse_positional_flags(source, info, flags_on, flags_off):
     "Parses positional flags."
     info.flags = (info.flags | flags_on) & ~flags_off
-    source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-    source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+    source.ignore_space = bool(info.flags & VERBOSE)
 
-def parse_name(source, allow_numeric=False, allow_group_0=False,
-  allow_offset=False, allow_empty=False):
+def parse_name(source, allow_numeric=False, allow_group_0=False):
     "Parses a name."
-    if allow_offset:
-        char_set = ")>+-"
-    else:
-        char_set = ")>"
-    name = source.get_while(set(char_set), include=False)
+    name = source.get_while(set(")>"), include=False)
 
     if not name:
-        if allow_empty:
-            return None
         raise error("missing group name", source.string, source.pos)
 
     if name.isdigit():
@@ -1307,42 +1586,6 @@ def parse_name(source, allow_numeric=False, allow_group_0=False,
               source.pos)
 
     return name
-
-def parse_offset(source, sign=None, allow_empty=False):
-    "Parses an offset."
-    if not sign:
-        saved_pos = source.pos
-        ch = source.get()
-        if ch == "+":
-            sign = 1
-        elif ch == "-":
-            sign = -1
-        else:
-            if allow_empty:
-                source.pos = saved_pos
-                return None
-            raise error("bad character in offset", source.string, saved_pos)
-    elif sign == "+":
-        sign = 1
-    elif sign == "-":
-        sign = -1
-    else:
-        if allow_empty:
-            return None
-        raise error("bad character in offset", source.string, source.pos)
-    
-    offset = source.get_while(DIGITS)
-    
-    if not offset:
-        raise error("bad character in offset", source.string, source.pos)
-    
-    offset = int(offset)
-    
-    if offset == 0:
-        if allow_empty:
-            return None
-        raise error("bad character in offset", source.string, source.pos)
-    return sign * offset
 
 def is_octal(string):
     "Checks whether a string is octal."
@@ -1460,7 +1703,7 @@ def parse_numeric_escape(source, info, ch, in_set):
     if info.is_open_group(digits):
         raise error("cannot refer to an open group", source.string, source.pos)
 
-    return make_ref_group(info, digits, None, source.pos)
+    return make_ref_group(info, digits, source.pos)
 
 def parse_octal_escape(source, info, digits, in_set):
     "Parses an octal escape sequence."
@@ -1510,19 +1753,12 @@ def parse_group_ref(source, info):
     "Parses a group reference."
     source.expect("<")
     saved_pos = source.pos
-    version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
-    if version == VERSION1:
-        name = parse_name(source, allow_numeric=True, allow_offset=True,
-          allow_empty=True)
-        offset = parse_offset(source, allow_empty=bool(name))
-    else:
-        name = parse_name(source, allow_numeric=True)
-        offset = None
+    name = parse_name(source, True)
     source.expect(">")
-    if name and info.is_open_group(name):
+    if info.is_open_group(name):
         raise error("cannot refer to an open group", source.string, source.pos)
 
-    return make_ref_group(info, name, offset, saved_pos)
+    return make_ref_group(info, name, saved_pos)
 
 def parse_string_set(source, info):
     "Parses a string set reference."
@@ -1538,7 +1774,7 @@ def parse_named_char(source, info, in_set):
     "Parses a named character."
     saved_pos = source.pos
     if source.match("{"):
-        name = source.get_while(NAMED_CHAR_PART)
+        name = source.get_while(NAMED_CHAR_PART, keep_spaces=True)
         if source.match("}"):
             try:
                 value = unicodedata.lookup(name)
@@ -1598,8 +1834,7 @@ def parse_set(source, info):
     version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
 
     saved_ignore = source.ignore_space
-    if not source.ignore_set_space:
-        source.ignore_space = False
+    source.ignore_space = False
     # Negative set?
     negate = source.match("^")
     try:
@@ -2047,8 +2282,8 @@ class RegexBase:
 
         return self.rebuild(positive, case_flags, zerowidth)
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        return last_group
+    def fix_groups(self, pattern, reverse, fuzzy):
+        pass
 
     def optimise(self, info, reverse):
         return self
@@ -2152,8 +2387,8 @@ class Atomic(RegexBase):
         RegexBase.__init__(self)
         self.subpattern = subpattern
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        return self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.subpattern.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         self.subpattern = self.subpattern.optimise(info, reverse)
@@ -2212,10 +2447,9 @@ class Branch(RegexBase):
         RegexBase.__init__(self)
         self.branches = branches
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+    def fix_groups(self, pattern, reverse, fuzzy):
         for b in self.branches:
-            last_group = b.fix_groups(pattern, reverse, fuzzy, last_group)
-        return last_group
+            b.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         if not self.branches:
@@ -2601,32 +2835,22 @@ class Branch(RegexBase):
         return max(b.max_width() for b in self.branches)
 
 class CallGroup(RegexBase):
-    def __init__(self, info, group, offset, position):
+    def __init__(self, info, group, position):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
-        self.offset = offset
         self.position = position
 
-        self._key = self.__class__, self.group, self.offset
+        self._key = self.__class__, self.group
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        if not self.group and self.offset:
-            self.group = last_group + self.offset
-            if self.offset < 0:
-                self.group += 1
-        else:
+    def fix_groups(self, pattern, reverse, fuzzy):
+        try:
+            self.group = int(self.group)
+        except ValueError:
             try:
-                self.group = int(self.group)
-            except ValueError:
-                try:
-                    self.group = self.info.group_index[self.group]
-                except KeyError:
-                    raise error("invalid group reference", pattern, self.position)
-            if self.offset:
-                self.group += self.offset
-        
-        self.offset = None
+                self.group = self.info.group_index[self.group]
+            except KeyError:
+                raise error("invalid group reference", pattern, self.position)
 
         if not 0 <= self.group <= self.info.group_count:
             raise error("unknown group", pattern, self.position)
@@ -2636,8 +2860,8 @@ class CallGroup(RegexBase):
 
         self.info.group_calls.append((self, reverse, fuzzy))
 
-        self._key = self.__class__, self.group, self.offset
-        
+        self._key = self.__class__, self.group
+
     def remove_captures(self):
         raise error("group reference not allowed", pattern, self.position)
 
@@ -2645,8 +2869,7 @@ class CallGroup(RegexBase):
         return [(OP.GROUP_CALL, self.call_ref)]
 
     def dump(self, indent, reverse):
-        print("{}GROUP_CALL {}{}".format(INDENT * indent,
-          self.group or "", self.offset or ""))
+        print("{}GROUP_CALL {}".format(INDENT * indent, self.group))
 
     def __eq__(self, other):
         return type(self) is type(other) and self.group == other.group
@@ -2741,20 +2964,15 @@ class Character(RegexBase):
         return 0, self
 
 class Conditional(RegexBase):
-    def __init__(self, info, group, offset, yes_item, no_item, position):
+    def __init__(self, info, group, yes_item, no_item, position):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
-        self.offset = offset
         self.yes_item = yes_item
         self.no_item = no_item
         self.position = position
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        if not self.group and self.offset:
-            self.group = last_group + self.offset
-            if self.offset < 0:
-                self.group += 1
+    def fix_groups(self, pattern, reverse, fuzzy):
         try:
             self.group = int(self.group)
         except ValueError:
@@ -2765,26 +2983,20 @@ class Conditional(RegexBase):
                     # 'DEFINE' is a special name unless there's a group with
                     # that name.
                     self.group = 0
-                    if self.offset:
-                        raise error("invalid offset", pattern, self.position)
                 else:
                     raise error("unknown group", pattern, self.position)
-            if self.offset:
-                self.group += self.offset
-        
-        self.offset = None
 
         if not 0 <= self.group <= self.info.group_count:
             raise error("invalid group reference", pattern, self.position)
 
-        last_group = self.yes_item.fix_groups(pattern, reverse, fuzzy, last_group)
-        return self.no_item.fix_groups(pattern, reverse, fuzzy, last_group)
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         yes_item = self.yes_item.optimise(info, reverse)
         no_item = self.no_item.optimise(info, reverse)
 
-        return Conditional(info, self.group, self.offset, yes_item, no_item, self.position)
+        return Conditional(info, self.group, yes_item, no_item, self.position)
 
     def pack_characters(self, info):
         self.yes_item = self.yes_item.pack_characters(info)
@@ -2821,8 +3033,7 @@ class Conditional(RegexBase):
         return code
 
     def dump(self, indent, reverse):
-        print("{}GROUP_EXISTS {}{}".format(INDENT * indent,
-          self.group or "", self.offset or ""))
+        print("{}GROUP_EXISTS {}".format(INDENT * indent, self.group))
         self.yes_item.dump(indent + 1, reverse)
         if not self.no_item.is_empty():
             print("{}OR".format(INDENT * indent))
@@ -2832,9 +3043,8 @@ class Conditional(RegexBase):
         return self.yes_item.is_empty() and self.no_item.is_empty()
 
     def __eq__(self, other):
-        return type(self) is type(other) and (self.group, self.offset,
-          self.yes_item, self.no_item) == (other.group, other.offset,
-          other.yes_item, other.no_item)
+        return type(self) is type(other) and (self.group, self.yes_item,
+          self.no_item) == (other.group, other.yes_item, other.no_item)
 
     def max_width(self):
         return max(self.yes_item.max_width(), self.no_item.max_width())
@@ -2853,27 +3063,238 @@ class DefaultEndOfWord(ZeroWidthBase):
 class DefaultStartOfWord(ZeroWidthBase):
     _opcode = OP.DEFAULT_START_OF_WORD
     _op_name = "DEFAULT_START_OF_WORD"
-    
+
 class EmbeddedCode(RegexBase):
-    def __init__(self, code, halt_time):
+    def __init__(self, code_id, halt_timer, advance, backtrack):
         RegexBase.__init__(self)
-        self.code = code
-        self.halt_time = halt_time
-        
-        self._key = self.__class__, self.code, self.halt_time
-        
+        self.code_id = code_id
+        self.halt_timer = halt_timer
+        self.advance = advance
+        self.backtrack = backtrack
+
+        self._key = (self.__class__, self.code_id, self.halt_timer, self.advance,
+          self.backtrack)
+
+    def remove_captures(self):
+        return Sequence()
+
     def get_firstset(self, reverse):
-        return {None}
-    
+        return set([None])
+
     def _compile(self, reverse, fuzzy):
-        return [(OP.EMBEDDED_CODE, self.code, int(self.halt_time))]
-    
+        if self.advance:
+            if self.backtrack:
+                op = OP.EXEC_CODE
+            else:
+                op = OP.EXEC_CODE_ADV
+        else:
+            op = OP.EXEC_CODE_REV
+        return [(op, self.code_id, int(self.halt_timer))]
+
     def dump(self, indent, reverse):
-        mode = {True: "HALT", False: "CONTINUE"}
-        print("{}EMBEDDED_CODE {} {}".format(INDENT * indent, self.code, mode[self.halt_time]))
-    
+        if self.advance:
+            if self.backtrack:
+                adv = "BOTH"
+            else:
+                adv = "ADVANCE"
+        else:
+            adv = "BACKTRACK"
+        if self.halt_timer:
+            halt = "HALT"
+        else:
+            halt = "CONTINUE"
+        print("{}EMBEDDED_CODE {} {} {}".format(INDENT * indent,
+          self.code_id, halt, adv))
+
     def max_width(self):
         return 0
+
+class EmbeddedCodeRef(RegexBase):
+    def __init__(self, info, name, halt_timer, advance, backtrack, pos):
+        RegexBase.__init__(self)
+        self.info = info
+        self.code_id = name
+        self.halt_timer = halt_timer
+        self.advance = advance
+        self.backtrack = backtrack
+        self.pos = pos
+
+        self._key = (self.__class__, self.code_id, self.halt_timer,
+          self.advance, self.backtrack)
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        name = self.code_id
+        self.code_id = self.info.get_code_id(self.code_id)
+        if self.code_id is None:
+            raise error(f"unknown code reference: {name}", pattern,
+              self.pos)
+
+        self._key = (self.__class__, self.code_id, self.halt_timer,
+          self.advance, self.backtrack)
+
+    def optimise(self, info, reverse):
+        return EmbeddedCode(self.code_id, self.halt_timer, self.advance,
+          self.backtrack)
+
+    def dump(self, indent, reverse):
+        print("{}EMBEDDED_CODE_REF {}".format(INDENT * indent,
+          self.code_id))
+
+class EmbeddedCodeEval(RegexBase):
+    def __init__(self, source, info, name, start_pos, end_pos):
+        RegexBase.__init__(self)
+        self.source = source
+        self.info = info
+        self.flags = info.flags
+        self.code_id = name
+        self.start_pos = start_pos
+        self.end_pos = end_pos
+
+        self._key = (self.__class__, self.flags, self.code_id, self.start_pos,
+          self.end_pos)
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        name = self.code_id
+        self.code_id = self.info.get_code_id(self.code_id)
+        if self.code_id is None:
+            raise error(f"unknown code reference: {name}", pattern,
+              self.start_pos)
+
+        self._key = (self.__class__, self.flags, self.code_id, self.start_pos,
+          self.end_pos)
+
+    def optimise(self, info, reverse):
+        return insert_code(self.source, self.info, self.flags,
+          self.info.code_text.get(self.code_id), self.start_pos, self.end_pos,
+          True)
+
+    def dump(self, indent, reverse):
+        print("{}EMBEDDED_CODE_REF_EVAL {}".format(INDENT * indent, self.code_id))
+
+    def __del__(self):
+        self.source = None
+        self.info = None
+
+class EmbeddedCodeConditional(RegexBase):
+    def __init__(self, code_id, halt_timer, yes_item, no_item):
+        RegexBase.__init__(self)
+        self.code_id = code_id
+        self.halt_timer = halt_timer
+        self.yes_item = yes_item
+        self.no_item = no_item
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
+
+    def optimise(self, info, reverse):
+        yes_item = self.yes_item.optimise(info, reverse)
+        no_item = self.no_item.optimise(info, reverse)
+
+        return EmbeddedCodeConditional(self.code_id, self.halt_timer, yes_item,
+          no_item)
+
+    def pack_characters(self, info):
+        self.yes_item = self.yes_item.pack_characters(info)
+        self.no_item = self.no_item.pack_characters(info)
+        return self
+
+    def remove_captures(self):
+        self.yes_item = self.yes_item.remove_captures()
+        self.no_item = self.no_item.remove_captures()
+
+    def is_atomic(self):
+        return self.yes_item.is_atomic() and self.no_item.is_atomic()
+
+    def can_be_affix(self):
+        return self.yes_item.can_be_affix() and self.no_item.can_be_affix()
+
+    def contains_group(self):
+        return self.yes_item.contains_group() or self.no_item.contains_group()
+
+    def get_firstset(self, reverse):
+        return (self.yes_item.get_firstset(reverse) |
+          self.no_item.get_firstset(reverse))
+
+    def _compile(self, reverse, fuzzy):
+        code = [(OP.EXEC_CODE_CONDITIONAL, self.code_id, int(self.halt_timer))]
+        code.extend(self.yes_item.compile(reverse, fuzzy))
+        add_code = self.no_item.compile(reverse, fuzzy)
+        if add_code:
+            code.append((OP.NEXT, ))
+            code.extend(add_code)
+
+        code.append((OP.END, ))
+
+        return code
+
+    def dump(self, indent, reverse):
+        if self.halt_timer:
+            halt = "HALT"
+        else:
+            halt = "CONTINUE"
+        print("{}CODE_CONDITIONAL {} {}".format(INDENT * indent,
+          self.code_id, halt))
+        self.yes_item.dump(indent + 1, reverse)
+        if not self.no_item.is_empty():
+            print("{}OR".format(INDENT * indent))
+            self.no_item.dump(indent + 1, reverse)
+
+    def __eq__(self, other):
+        return type(self) is type(other) and (self.code_id, self.halt_timer,
+          self.yes_item, self.no_item) == (other.code_id, other.halt_timer,
+          other.yes_item, other.no_item)
+
+    def max_width(self):
+        return max(self.yes_item.max_width(), self.no_item.max_width())
+
+class EmbeddedCodeRefConditional(RegexBase):
+    def __init__(self, info, name, halt_timer, yes_item, no_item, pos):
+        RegexBase.__init__(self)
+        self.info = info
+        self.code_id = name
+        self.halt_timer = halt_timer
+        self.yes_item = yes_item
+        self.no_item = no_item
+        self.pos = pos
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        name = self.code_id
+        self.code_id = self.info.get_code_id(name)
+        if self.code_id is None or self.code_id < 0:
+                raise error(f"unknown code reference: {name}", pattern,
+                  self.pos)
+
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
+
+    def optimise(self, info, reverse):
+        yes_item = self.yes_item.optimise(info, reverse)
+        no_item = self.no_item.optimise(info, reverse)
+
+        return EmbeddedCodeConditional(self.code_id, self.halt_timer, yes_item,
+          no_item)
+
+    def dump(self, indent, reverse):
+        if self.halt_timer:
+            halt = "HALT"
+        else:
+            halt = "CONTINUE"
+        print("{}CODE_REF_CONDITIONAL {} {}".format(INDENT * indent,
+          self.code_id, halt))
+        self.yes_item.dump(indent + 1, reverse)
+        if not self.no_item.is_empty():
+            print("{}OR".format(INDENT * indent))
+            self.no_item.dump(indent + 1, reverse)
+
+    def __eq__(self, other):
+        return type(self) is type(other) and (self.code_id, self.halt_timer,
+          self.yes_item, self.no_item) == (other.code_id, other.halt_timer,
+          other.yes_item, other.no_item)
+
+    def __del__(self):
+        self.info = None
+
 
 class EndOfLine(ZeroWidthBase):
     _opcode = OP.END_OF_LINE
@@ -2941,8 +3362,8 @@ class Fuzzy(RegexBase):
             constraints["cost"] = {"d": 1, "i": 1, "s": 1, "max":
               constraints["e"][1]}
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        return self.subpattern.fix_groups(pattern, reverse, True, last_group)
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.subpattern.fix_groups(pattern, reverse, True)
 
     def pack_characters(self, info):
         self.subpattern = self.subpattern.pack_characters(info)
@@ -3067,8 +3488,8 @@ class GreedyRepeat(RegexBase):
         self.min_count = min_count
         self.max_count = max_count
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        return self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.subpattern.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, reverse)
@@ -3188,9 +3609,9 @@ class Group(RegexBase):
 
         self.call_ref = None
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+    def fix_groups(self, pattern, reverse, fuzzy):
         self.info.defined_groups[self.group] = (self, reverse, fuzzy)
-        return self.subpattern.fix_groups(pattern, reverse, fuzzy, self.group)
+        self.subpattern.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, reverse)
@@ -3278,8 +3699,8 @@ class LookAround(RegexBase):
         self.positive = bool(positive)
         self.subpattern = subpattern
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        return self.subpattern.fix_groups(pattern, self.behind, fuzzy, last_group)
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.subpattern.fix_groups(pattern, self.behind, fuzzy)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, self.behind)
@@ -3348,10 +3769,10 @@ class LookAroundConditional(RegexBase):
         self.yes_item = yes_item
         self.no_item = no_item
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        last_group = self.subpattern.fix_groups(pattern, reverse, fuzzy, last_group)
-        last_group = self.yes_item.fix_groups(pattern, reverse, fuzzy, last_group)
-        return self.no_item.fix_groups(pattern, reverse, fuzzy, last_group)
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.subpattern.fix_groups(pattern, reverse, fuzzy)
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         subpattern = self.subpattern.optimise(info, self.behind)
@@ -3571,38 +3992,28 @@ class RefGroup(RegexBase):
       True): OP.REF_GROUP_IGN_REV, (FULLCASE, True): OP.REF_GROUP_REV,
       (FULLIGNORECASE, True): OP.REF_GROUP_FLD_REV}
 
-    def __init__(self, info, group, offset, position, case_flags=NOCASE):
+    def __init__(self, info, group, position, case_flags=NOCASE):
         RegexBase.__init__(self)
         self.info = info
         self.group = group
-        self.offset = offset
         self.position = position
         self.case_flags = CASE_FLAGS_COMBINATIONS[case_flags]
 
-        self._key = self.__class__, self.group, self.offset, self.case_flags
+        self._key = self.__class__, self.group, self.case_flags
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
-        if not self.group and self.offset:
-            self.group = last_group + self.offset
-            if self.offset < 0:
-                self.group += 1
-        else:
+    def fix_groups(self, pattern, reverse, fuzzy):
+        try:
+            self.group = int(self.group)
+        except ValueError:
             try:
-                self.group = int(self.group)
-            except ValueError:
-                try:
-                    self.group = self.info.group_index[self.group]
-                except KeyError:
-                    raise error("unknown group", pattern, self.position)
-            if self.offset:
-                self.group += self.offset
-        
-        self.offset = None
+                self.group = self.info.group_index[self.group]
+            except KeyError:
+                raise error("unknown group", pattern, self.position)
 
         if not 1 <= self.group <= self.info.group_count:
             raise error("invalid group reference", pattern, self.position)
 
-        self._key = self.__class__, self.group, self.offset, self.case_flags
+        self._key = self.__class__, self.group, self.case_flags
 
     def remove_captures(self):
         raise error("group reference not allowed", pattern, self.position)
@@ -3614,8 +4025,8 @@ class RefGroup(RegexBase):
         return [(self._opcode[self.case_flags, reverse], flags, self.group)]
 
     def dump(self, indent, reverse):
-        print("{}REF_GROUP {}{}{}".format(INDENT * indent,
-          self.group or "", self.offset or "", CASE_TEXT[self.case_flags]))
+        print("{}REF_GROUP {}{}".format(INDENT * indent, self.group,
+          CASE_TEXT[self.case_flags]))
 
     def max_width(self):
         return UNLIMITED
@@ -3635,10 +4046,9 @@ class Sequence(RegexBase):
 
         self.items = items
 
-    def fix_groups(self, pattern, reverse, fuzzy, last_group):
+    def fix_groups(self, pattern, reverse, fuzzy):
         for s in self.items:
-            last_group = s.fix_groups(pattern, reverse, fuzzy, last_group)
-        return last_group
+            s.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
         # Flatten the sequences.
@@ -4237,6 +4647,7 @@ class Source:
         self.pos = 0
         self.ignore_space = False
         self.sep = string[ : 0]
+        self.modified = False
 
     def get(self, override_ignore=False):
         string = self.string
@@ -4304,11 +4715,11 @@ class Source:
             self.pos = len(string)
             return "".join(substring)
 
-    def get_while(self, test_set, include=True):
+    def get_while(self, test_set, include=True, keep_spaces=False):
         string = self.string
         pos = self.pos
 
-        if self.ignore_space:
+        if self.ignore_space and not keep_spaces:
             try:
                 substring = []
 
@@ -4449,17 +4860,18 @@ class Source:
 class Info:
     "Info about the regular expression."
 
-    def __init__(self, flags=0, char_type=None, kwargs={}):
+    def __init__(self, flags=0, char_type=None, kwargs={}, globals=None,
+      locals=None):
         flags |= DEFAULT_FLAGS[(flags & _ALL_VERSIONS) or DEFAULT_VERSION]
         self.flags = flags
         self.global_flags = flags
         self.inline_locale = False
+        self.defer_code = False
+        self.evaluating = False
 
         self.kwargs = kwargs
-        
-        self.code_count = 0
-        self.code_index = {}
-        self.code_text = {}
+        self.globals = globals or {}
+        self.locals = locals or {}
 
         self.group_count = 0
         self.group_index = {}
@@ -4471,19 +4883,12 @@ class Info:
         self.defined_groups = {}
         self.group_calls = []
         self.private_groups = {}
-        
-    def code(self, code):
-        if code.isspace():
-            return -1
-        
-        index = self.code_index.get(code)
-        if index is None:
-            index = self.code_count
-            self.code_count += 1
-            self.code_index[code] = index
-            self.code_text[index] = code
-            
-        return index
+
+        self.code_count = 0
+        self.code_index = {}
+        self.code_text = {}
+        self.code_refs = {}
+        self.insertion_offset = 0
 
     def open_group(self, name=None):
         group = self.group_index.get(name)
@@ -4528,6 +4933,37 @@ class Info:
 
         return group in self.open_groups
 
+    def empty_code(self, text):
+        source = Source(text)
+        source.skip_while(WHITESPACE)
+        while source.match("#"):
+            source.pos = source.string.index("\n", source.pos)
+            source.skip_while(WHITESPACE)
+        return source.at_end()
+
+    def code(self, text, name):
+        index = self.code_index.get(text)
+        if index is None:
+            if self.empty_code(text):
+                index = -1
+                text = None
+            else:
+                index = self.code_count
+                self.code_count += 1
+            self.code_index[text] = index
+            self.code_text[index] = text
+
+        if name and name not in self.code_refs:
+            self.code_refs[name] = index
+
+        return index
+
+    def get_code_id(self, name):
+        return self.code_refs.get(name)
+
+    def get_code(self, id):
+        return self.code_text.get(id)
+
 def _check_group_features(info, parsed):
     """Checks whether the reverse and fuzzy features of the group calls match
     the groups which they call.
@@ -4571,6 +5007,7 @@ def _get_required_string(parsed, flags):
     "Gets the required string and related info of a parsed pattern."
 
     req_offset, required = parsed.get_required_string(bool(flags & REVERSE))
+
     if required:
         required.required = True
         if req_offset >= UNLIMITED:
@@ -4589,7 +5026,7 @@ def _get_required_string(parsed, flags):
     return req_offset, req_chars, req_flags
 
 class Scanner:
-    def __init__(self, lexicon, flags=0):
+    def __init__(self, lexicon, flags=0, globals=None, locals=None):
         self.lexicon = lexicon
 
         # Combine phrases into a compound pattern.
@@ -4598,8 +5035,7 @@ class Scanner:
             # Parse the regular expression.
             source = Source(phrase)
             info = Info(flags, source.char_type)
-            source.ignore_space = bool(info.flags & _ALL_VERBOSE)
-            source.ignore_set_space = bool(info.flags & FULLVERBOSE)
+            source.ignore_space = bool(info.flags & VERBOSE)
             parsed = _parse_pattern(source, info)
             if not source.at_end():
                 raise error("unbalanced parenthesis", source.string,
@@ -4661,7 +5097,7 @@ class Scanner:
         # PatternObject.
         self.scanner = _regex.compile(None, (flags & GLOBAL_FLAGS) | version,
           code, {}, {}, {}, [], req_offset, req_chars, req_flags,
-          len(patterns))
+          len(patterns), (), globals, locals)
 
     def scan(self, string):
         result = []

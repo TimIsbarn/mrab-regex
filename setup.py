@@ -6,7 +6,7 @@ with open('README.rst', encoding='utf-8') as file:
     long_description = file.read()
 
 setup(
-    name='regexd',
+    name='regex',
     version='2024.4.28',
     description='Alternative regular expression module, to replace re.',
     long_description=long_description,
@@ -21,7 +21,6 @@ setup(
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Apache Software License',
         'Operating System :: OS Independent',
-        'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
@@ -32,11 +31,11 @@ setup(
         'Topic :: Text Processing',
         'Topic :: Text Processing :: General',
     ],
-    python_requires='>=3.7',
+    python_requires='>=3.8',
 
-    package_dir={'regexd': 'regex_3'},
-    py_modules=['regexd.__init__', 'regexd.regex', 'regexd._regex_core',
-     'regexd.test_regex'],
-    ext_modules=[Extension('regexd._regex', [join('regex_3', '_regex.c'),
+    package_dir={'regex': 'regex_3'},
+    py_modules=['regex.__init__', 'regex.regex', 'regex._regex_core',
+     'regex.test_regex'],
+    ext_modules=[Extension('regex._regex', [join('regex_3', '_regex.c'),
       join('regex_3', '_regex_unicode.c')])],
 )

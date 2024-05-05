@@ -35,7 +35,7 @@
  * other compatibility work.
  */
 
-#define VERBOSE
+//#define VERBOSE
 
 #define RE_MEMORY_LIMIT 0x40000000
 
@@ -62,16 +62,19 @@
 #endif
 #endif
 
-static const char* py_object_str(PyObject* obj) {
-	PyObject* str_object = PyObject_Str(obj);
-	const char* text = PyUnicode_AsUTF8(str_object);
-	Py_DECREF(str_object);
-	return text;
-}
-
 #if defined(VERBOSE)
-#define TRACE_PY(X) printf("PyObject: %s\n", py_object_str(X));
+#define TRACE_PY_GIL(X) acquire_GIL(state); TRACE_PY(X); release_GIL(state);
+Py_LOCAL_INLINE(void) TRACE_PY(PyObject* obj) {
+    if (!obj)
+        printf("PyObject 0: <NULL>\n");
+    else {
+        printf("PyObject %" PY_FORMAT_SIZE_T "d %p: ", Py_REFCNT(obj), obj);
+        PyObject_Print(obj, stdout, 0);
+        printf("\n");
+    }
+}
 #else
+#define TRACE_PY_GIL(X)
 #define TRACE_PY(X)
 #endif
 
@@ -136,8 +139,10 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_ERROR_NOT_BYTES -14 /* Not a bytestring. */
 #define RE_ERROR_BAD_TIMEOUT -15 /* "timeout" invalid. */
 #define RE_ERROR_TIMED_OUT -16 /* Matching has timed out. */
-#define RE_ERROR_EMBEDDED_CODE -17 /* Error in executed embedded code. */
-#define RE_ERROR_DELETE -18 /* Attempt to delete attribute. */
+#define RE_ERROR_LOCKED -17 /* Attempt to match on a locked state. */
+#define RE_ERROR_INVALID_STATE -18 /* Attempt to use an invalidate state object. */
+#define RE_ERROR_BAD_GLOBALS -19 /* Globals have to be a dict. */
+#define RE_ERROR_BAD_LOCALS -20 /* Locals has to support mapping. */
 
 /* Node bitflags. */
 #define RE_POSITIVE_OP 0x1
@@ -475,8 +480,8 @@ typedef struct ByteStack {
 /* The state object used during matching. */
 typedef struct RE_State {
     struct PatternObject* pattern; /* Parent PatternObject. */
-    PyObject* globals; /* Global dict for embedded code. */
-    PyObject* locals; /* Local dict for embedded code. */
+    PyObject* globals; /* The global dict for embedded code. */
+    PyObject* locals; /* The local dict for embedded code. */
     /* Info about the string being matched. */
     PyObject* string;
     Py_buffer view; /* View of the string if it's a buffer object. */
@@ -533,8 +538,8 @@ typedef struct RE_State {
     Py_ssize_t req_end; /* The end position where the required string matched. */
     Py_ssize_t timeout; /* The timeout in clock ticks. */
     clock_t start_time; /* The clock time when matching started. */
-    clock_t embedded_code_time; /* The clock time when the embedded code is executed. */
-    clock_t halted_time; /* Time spent waiting until the end of an embedded code. */
+    clock_t execute_time; /* The clock time when executing embedded code. */
+    clock_t skipped_time; /* The clock time difference that should be excluded. */
     int partial_side; /* The side that could truncate in a partial match. */
     /* Various flags. */
     RE_UINT16 iterations; /* The number of iterations the matching engine has performed since checking for KeyboardInterrupt. */
@@ -550,7 +555,7 @@ typedef struct RE_State {
     BOOL match_all; /* Whether to match all of the string ('fullmatch'). */
     BOOL found_match; /* Whether a POSIX match has been found. */
     BOOL is_fuzzy; /* Whether the pattern is fuzzy. */
-    BOOL no_code; /* Whether to skip all embedded code. */
+    BOOL run_code; /* Whether embedded code is permitted. */
     BOOL backtracking; /* Whether the engine is backtracking. */
     BOOL locked; /* Whether the state is locked. */
 } RE_State;
@@ -558,11 +563,8 @@ typedef struct RE_State {
 /* The PatternObject created from a regular expression. */
 typedef struct PatternObject {
     PyObject_HEAD
-    PyObject* module; /* Link to the _regex module. */
     PyObject* pattern; /* Pattern source (or None). */
-    PyObject* globals; /* The global dict for embedded code. */
-    PyObject* locals; /* The local dict for embedded code. */
-    PyObject* embedded_code; /* Embedded code. */
+    PyObject* module; /* The _regex module. */
     Py_ssize_t flags; /* Flags used when compiling pattern source. */
     PyObject* packed_code_list;
     PyObject* weakreflist; /* List of weak references */
@@ -576,6 +578,11 @@ typedef struct PatternObject {
     Py_ssize_t group_end_index; /* The number of group closures. */
     PyObject* groupindex;
     PyObject* indexgroup;
+    PyObject* code; /* The uncompiled code. */
+    PyObject* globals; /* The global dict for embedded code. */
+    PyObject* locals; /* The local dict for embedded code. */
+    size_t code_count;
+    PyObject** compiled_code; /* Code that's already compiled. */
     PyObject* named_lists;
     size_t named_lists_count;
     PyObject** partial_named_lists[2];
@@ -634,13 +641,14 @@ typedef struct MatchObject {
 } MatchObject;
 
 /* The StateObject created when running embedded code. */
-//TODO method for executing regex actions
-//TODO define local variables and act as an atomic group on those
 typedef struct StateObject {
-	PyObject_HEAD
-	MatchObject* match; /* Link to a match object to reduce code duplication. */
-	RE_State* state; /* Link to the calling state. */
-	BOOL failure; /* Whether the embedded code failed. */
+    PyObject_HEAD
+    MatchObject* match;
+    RE_State* state;
+    RE_STATUS_T status;
+    BOOL advance;
+    BOOL in_conditional;
+    BOOL valid;
 } StateObject;
 
 /* The ScannerObject. */
@@ -2084,18 +2092,20 @@ Py_LOCAL_INLINE(void) set_error(int status, PyObject* object) {
     PyErr_Clear();
 
     switch (status) {
+    case RE_ERROR_BAD_GLOBALS:
+        PyErr_SetString(PyExc_ValueError, "globals not dict or None");
+        break;
+    case RE_ERROR_BAD_LOCALS:
+        PyErr_SetString(PyExc_ValueError, "locals not None or supports __getitem__");
+        break;
     case RE_ERROR_BAD_TIMEOUT:
         PyErr_SetString(PyExc_ValueError, "timeout not float or None");
         break;
     case RE_ERROR_CANCELLED:
-	case RE_ERROR_EMBEDDED_CODE:
         /* An exception has already been raised, so let it fly. */
         break;
     case RE_ERROR_CONCURRENT:
         PyErr_SetString(PyExc_ValueError, "concurrent not int or None");
-        break;
-    case RE_ERROR_DELETE:
-        PyErr_SetString(PyExc_RuntimeError, "cannot delete attribute");
         break;
     case RE_ERROR_GROUP_INDEX_TYPE:
         if (object)
@@ -2117,6 +2127,15 @@ Py_LOCAL_INLINE(void) set_error(int status, PyObject* object) {
             error_exception = get_object("regex._regex_core", "error");
 
         PyErr_SetString(error_exception, "invalid group reference");
+        break;
+    case RE_ERROR_INVALID_STATE:
+        PyErr_SetString(PyExc_TypeError, "state is invalid");
+        break;
+    case RE_ERROR_LOCKED:
+        if (!error_exception)
+            error_exception = get_object("regex._regex_core", "error");
+
+        PyErr_SetString(error_exception, "state is locked");
         break;
     case RE_ERROR_MEMORY:
         PyErr_NoMemory();
@@ -2248,7 +2267,8 @@ Py_LOCAL_INLINE(BOOL) check_timed_out(RE_State* state) {
         /* No timeout. */
         return FALSE;
 
-    if ((Py_ssize_t)(clock() - state->start_time) < state->timeout)
+    if ((Py_ssize_t)(clock() - state->start_time - state->skipped_time) <
+      state->timeout)
         /* Hasn't timed out yet. */
         return FALSE;
 
@@ -2257,17 +2277,28 @@ Py_LOCAL_INLINE(BOOL) check_timed_out(RE_State* state) {
     return TRUE;
 }
 
-/* Checks whether to cancel due to a KeyboardInterrupt or a timeout. */
-Py_LOCAL_INLINE(BOOL) safe_check_cancel(RE_State* state) {
+/* Checks whether to cancel due to a KeyboardInterrupt or a timeout,
+ * assuming the gil is already acquired.
+ */
+Py_LOCAL_INLINE(BOOL) check_cancel(RE_State* state) {
     BOOL result;
-
-    acquire_GIL(state);
 
     result = (BOOL)PyErr_CheckSignals();
 
     if (!result)
         /* Has it timed out? */
         result = check_timed_out(state);
+
+    return result;
+}
+
+/* Checks whether to cancel due to a KeyboardInterrupt or a timeout. */
+Py_LOCAL_INLINE(BOOL) safe_check_cancel(RE_State* state) {
+    BOOL result;
+
+    acquire_GIL(state);
+
+    result = check_cancel(state);
 
     release_GIL(state);
 
@@ -11591,97 +11622,126 @@ Py_LOCAL_INLINE(PyObject*) pattern_new_match(PatternObject* pattern, RE_State*
   state, int status);
 
 static PyTypeObject State_Type = {
-	PyVarObject_HEAD_INIT(NULL, 0)
-	"_regex.State",
-	sizeof(StateObject)
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "_regex.State",
+    sizeof(StateObject)
 };
 
-/* Executes embedded code. */
-Py_LOCAL_INLINE(int) code_execute(RE_State* state, RE_CODE code_id,
-  RE_CODE halt_timer, BOOL def) {
-	PyObject* globals;
-	PyObject* locals;
-	PyObject* match;
-	StateObject* state_object;
-	PyObject* dict;
-	PyObject* str_object;
-	clock_t halt_time;
-	const char* code;
-	PyObject* result;
-	BOOL condition;
-	
-	acquire_GIL(state);
-            
-    globals = state->pattern->globals;
-    locals = state->pattern->locals;
-    
-    if (globals == Py_None)
-        globals = state->globals;
-    if (locals == Py_None)
-        locals = state->locals;
-    
-    if (globals == Py_None)
-        globals = PyEval_GetGlobals();
-    if (locals == Py_None)
-        locals = PyEval_GetLocals();
-        
+/* Returns a new StateObject. */
+Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state, RE_STATUS_T status,
+  BOOL advance, BOOL in_conditional) {
+    PyObject* match;
+    StateObject* result;
+
     match = pattern_new_match(state->pattern, state, RE_ERROR_SUCCESS);
     if (!match)
-        return RE_ERROR_MEMORY;
-        
-    state_object = PyObject_NEW(StateObject, &State_Type);
-    if (!state_object) {
-        Py_DECREF(match);
-        return RE_ERROR_MEMORY;
-    }
-    
-    state_object->match = (MatchObject*)match;
-    state_object->state = state;
-    state_object->failure = def;
-    
-    dict = PyModule_GetDict(state->pattern->module);
-    
-    PyDict_SetItemString(dict, "state", (PyObject*)state_object);
-    
-    /* PyList_GetItem borrows a reference. */    
-    str_object = PyList_GetItem(state->pattern->embedded_code, code_id);
-    if (!str_object) {
-        Py_DECREF(state_object);
-        return RE_ERROR_MEMORY;
-    }
-    
-    code = PyUnicode_AsUTF8(str_object);
-    if (!code) {
-        Py_DECREF(state_object);
-        return RE_ERROR_MEMORY;
-    }
-    
-    state->locked = TRUE;
-    
-    if (halt_timer)
-        halt_time = clock();
-    
-    result = PyRun_String(code, Py_file_input, globals, locals);
+        return NULL;
+
+    result = PyObject_NEW(StateObject, &State_Type);
     if (!result) {
-        Py_DECREF(state_object);
-        state->locked = FALSE;
-        return RE_ERROR_EMBEDDED_CODE;
+        Py_DECREF(match);
+        return NULL;
     }
-    Py_DECREF(result);
-    
+
+    result->match = (MatchObject*)match;
+    result->state = state;
+    result->status = status;
+    result->advance = advance;
+    result->in_conditional = in_conditional;
+    result->valid = TRUE;
+
+    return result;
+}
+
+/* Compiles and returns python code. */
+Py_LOCAL_INLINE(PyObject*) get_code(RE_State* state, RE_CODE code_id) {
+    PyObject* code_obj;
+    PyObject* str_object;
+    const char* code;
+
+    code_obj = state->pattern->compiled_code[code_id];
+
+    if (code_obj)
+        /* Already compiled. */
+        return code_obj;
+
+    /* PyTuple_GetItem borrows a reference. */
+    str_object = PyTuple_GetItem(state->pattern->code, code_id);
+    if (!str_object)
+        return NULL;
+
+    /* Retrieve string. */
+    code = PyUnicode_AsUTF8(str_object);
+    if (!code)
+        return NULL;
+
+    code_obj = Py_CompileString(code, "_regex.c", Py_file_input);
+    if (!code_obj)
+        return NULL;
+
+    state->pattern->compiled_code[code_id] = code_obj;
+
+    return code_obj;
+}
+
+/* Runs embedded code. */
+Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
+  RE_CODE code_id, RE_CODE halt_timer, BOOL def, BOOL in_conditional) {
+    StateObject* state_object;
+    PyObject* dict;
+    PyObject* code_obj;
+    PyObject* result;
+    BOOL advance;
+
+    TRACE(("<<code>>\n"))
+
+    /* Re-acquire the GIL. */
+    acquire_GIL(state);
+
+    code_obj = get_code(state, code_id);
+    if (!code_obj)
+        return RE_ERROR_MEMORY;
+
+    state->backtracking = !def;
+    state_object = new_state_object(state, status, def, in_conditional);
+    if (!state_object)
+        return RE_ERROR_MEMORY;
+
+    dict = PyModule_GetDict(state->pattern->module);
+    PyDict_SetItemString(dict, "state", (PyObject*)state_object);
+
+    state->locked = TRUE;
+    state->execute_time = clock();
+
+    /* Run the code. */
+    result = PyEval_EvalCode(code_obj, state->globals, state->locals);
+
     if (halt_timer)
-        state->halted_time += clock() - halt_time;
-        
-    state->locked = FALSE;
-    
-    condition = state_object->failure;
+        state->skipped_time += (clock() - state->execute_time);
+
+    advance = state_object->advance;
+
+    /* StateObject should no longer be used. */
+    state_object->valid = FALSE;    
+    Py_DECREF(state_object->match);
+    state_object->match = NULL;
     Py_DECREF(state_object);
-    
     PyDict_SetItemString(dict, "state", Py_None);
-    
+    state->locked = FALSE;
+
+    /* Invalid code, error has already been set. */
+    if (!result)
+        return RE_ERROR_CANCELLED;
+
+    Py_DECREF(result);
+
+    if (check_cancel(state))
+        return RE_ERROR_CANCELLED;
+
+    /* Release the GIL. */
     release_GIL(state);
-    
-    return condition ? RE_ERROR_FAILURE : RE_ERROR_SUCCESS;
+
+    return advance ? RE_ERROR_SUCCESS : RE_ERROR_FAILURE;
 }
 
 /* Performs a depth-first match or search from the context. */
@@ -11878,8 +11938,6 @@ next_match_2:
 
 advance:
     /* The main matching loop. */
-    state->backtracking = FALSE;
-    
     for (;;) {
         TRACE(("%" PY_FORMAT_SIZE_T "d|", state->text_pos))
 
@@ -12186,6 +12244,70 @@ advance:
             } else
                 goto backtrack;
             break;
+        case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_ADV:
+        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
+        {
+            int status;
+
+            /* args: code_id, halt_timer. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set. */
+            if (!state->run_code) {
+                node = node->next_1.node;
+                break;
+            }
+
+            if (node->op != RE_OP_EXEC_CODE_REV) {
+                status = code_run(state, node->status, node->values[0],
+                  node->values[1], TRUE, FALSE);
+
+                if (status == RE_ERROR_FAILURE)
+                    goto backtrack;
+                else if (status != RE_ERROR_SUCCESS)
+                    return status;
+            }
+
+            if (node->op != RE_OP_EXEC_CODE_ADV) {
+                if (!push_pointer(state, &state->bstack, node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_EXEC_CODE_CONDITIONAL: /* Embedded python code conditional. */
+        {
+            int status;
+
+            /* args: code_id, halt_timer. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set. */
+            if (!state->run_code) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_run(state, node->status, node->values[0],
+              node->values[1], TRUE, TRUE);
+
+            if (status == RE_ERROR_SUCCESS)
+                node = node->next_1.node;
+            else if (status == RE_ERROR_FAILURE)
+                node = node->nonstring.next_2.node;
+            else
+                return status;
+
+            break;
+        }
         case RE_OP_CONDITIONAL: /* Start of a conditional subpattern. */
         {
             RE_LookaroundStateData data_l;
@@ -12287,38 +12409,6 @@ advance:
             } else
                 goto backtrack;
             break;
-        case RE_OP_EMBEDDED_CODE: /* Embedded python code. */
-        {
-            int status;
-            
-            /* args: code_id, halt_timer. */
-            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
-              node->values[1]))
-              
-            /* Skip code when no_code is set. */
-            if (state->no_code) {
-                node = node->next_1.node;
-                break;
-            }
-            
-            status = code_execute(state, node->values[0], node->values[1],
-              FALSE);
-            
-            if (status == RE_ERROR_FAILURE)
-                goto backtrack;
-            else if (status != RE_ERROR_SUCCESS)
-                return status;
-                
-            if (!push_pointer(state, &state->bstack, node))
-                return RE_ERROR_MEMORY;
-            if (!push_uint8(state, &state->bstack, RE_OP_EMBEDDED_CODE))
-                return RE_ERROR_MEMORY;
-                
-            /* bstack: code_node EMBEDDED_CODE */
-            
-            node = node->next_1.node;
-            break;
-        }
         case RE_OP_END_ATOMIC: /* End of an atomic group. */
             TRACE(("%s\n", re_op_text[node->op]))
 
@@ -15197,8 +15287,6 @@ advance:
     }
 
 backtrack:
-	state->backtracking = TRUE;
-
     for (;;) {
         RE_UINT8 op;
         TRACE(("BACKTRACK "))
@@ -15381,6 +15469,40 @@ backtrack:
             if (!drop_pointer(state, &state->sstack))
                 return RE_ERROR_MEMORY;
             break;
+        case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
+        {
+            RE_Node* code_node;
+            int status;
+
+            /* bstack: code_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
+              code_node->values[1]))
+
+            status = code_run(state, code_node->status, code_node->values[0],
+              code_node->values[1], FALSE, FALSE);
+
+            if (status == RE_ERROR_FAILURE)
+                break;
+            else if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            if (!push_pointer(state, &state->bstack, code_node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, code_node->op))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node op */
+
+            node = code_node->next_1.node;
+            goto advance;
+        }
         case RE_OP_CONDITIONAL: /* Conditional subpattern. */
         {
             RE_Node* conditional;
@@ -15449,39 +15571,6 @@ backtrack:
                  */
                 node = conditional->nonstring.true_node;
 
-            goto advance;
-        }
-        case RE_OP_EMBEDDED_CODE: /* Embedded python code. */
-        {
-            RE_Node* code_node;
-            int status;
-            
-            /* bstack: code_node */
-            
-            if (!pop_pointer(state, &state->bstack, &code_node))
-                return RE_ERROR_MEMORY;
-            
-            /* bstack: - */
-            
-            TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
-              code_node->values[1]))
-            
-            status = code_execute(state, code_node->values[0],
-              code_node->values[1], TRUE);
-            
-            if (status == RE_ERROR_FAILURE)
-                break;
-            else if (status != RE_ERROR_SUCCESS)
-                return status;
-            
-            if (!push_pointer(state, &state->bstack, code_node))
-                return RE_ERROR_MEMORY;
-            if (!push_uint8(state, &state->bstack, RE_OP_EMBEDDED_CODE))
-                return RE_ERROR_MEMORY;
-                
-            /* bstack: code_node EMBEDDED_CODE */
-            
-            node = code_node->next_1.node;
             goto advance;
         }
         case RE_OP_END_ATOMIC: /* End of an atomic group. */
@@ -18307,8 +18396,8 @@ Py_LOCAL_INLINE(void) dealloc_groups(RE_GroupData* groups, size_t group_count)
 Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
   PyObject* string, RE_StringInfo* str_info, Py_ssize_t start, Py_ssize_t end,
   BOOL overlapped, int concurrent, BOOL partial, BOOL use_lock, BOOL
-  visible_captures, BOOL match_all, Py_ssize_t timeout, PyObject* globals,
-  PyObject* locals) {
+  visible_captures, BOOL match_all, Py_ssize_t timeout, PyObject* run_code,
+  PyObject* globals, PyObject* locals) {
     Py_ssize_t final_pos;
     int p;
 
@@ -18325,9 +18414,6 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
         pattern->stack_storage = NULL;
         pattern->stack_capacity = 0;
     }
-    
-    state->globals = globals;
-    state->locals = locals;
 
     state->groups = NULL;
     state->best_match_groups = NULL;
@@ -18495,6 +18581,14 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
     state->version_0 = (pattern->flags & RE_FLAG_VERSION1) == 0;
     state->must_advance = FALSE;
 
+    /* If code is set, use that, otherwise derive it from the flags. */
+    if (run_code == Py_None)
+        state->run_code = (pattern->flags & RE_FLAG_CODE) != 0;
+    else
+        state->run_code = run_code == Py_True;
+    state->backtracking = FALSE;
+    state->locked = FALSE;
+
     state->pattern = pattern;
     state->string = string;
 
@@ -18524,11 +18618,36 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
     state->fuzzy_changes.capacity = 0;
     state->fuzzy_changes.count = 0;
     state->fuzzy_changes.items = NULL;
-    
-    state->no_code = (pattern->flags & RE_FLAG_NO_CODE) != 0;
 
-	Py_INCREF(state->globals);
-	Py_INCREF(state->locals);
+    if (globals == Py_None) {
+        if (pattern->globals == Py_None) {
+            state->globals = PyDict_New();
+            if (!state->globals)
+                goto error;
+        } else {
+            state->globals = pattern->globals;
+            Py_INCREF(state->globals);
+        }
+    } else {
+        state->globals = globals;
+        Py_INCREF(state->globals);
+    }
+    if (locals == Py_None) {
+        if (pattern->locals == Py_None) {
+            state->locals = PyDict_New();
+            if (!state->locals) {
+                Py_DECREF(state->locals);
+                goto error;
+            }
+        } else {
+            state->locals = pattern->locals;
+            Py_INCREF(state->locals);
+        }
+    } else {
+        state->locals = locals;
+        Py_INCREF(state->locals);
+    }
+
     Py_INCREF(state->pattern);
     Py_INCREF(state->string);
 
@@ -18549,7 +18668,8 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
     }
 
     state->timeout = timeout;
-    state->halted_time = 0;
+    state->skipped_time = 0;
+    state->execute_time = 0;
     state->start_time = timeout == RE_NO_TIMEOUT ? 0 : clock();
 
     /* A state struct can sometimes be shared across threads. In such
@@ -18604,7 +18724,7 @@ Py_LOCAL_INLINE(void) release_buffer(RE_StringInfo* str_info) {
 Py_LOCAL_INLINE(BOOL) state_init(RE_State* state, PatternObject* pattern,
   PyObject* string, Py_ssize_t start, Py_ssize_t end, BOOL overlapped, int
   concurrent, BOOL partial, BOOL use_lock, BOOL visible_captures, BOOL
-  match_all, Py_ssize_t timeout, PyObject* globals, PyObject* locals) {
+  match_all, Py_ssize_t timeout, PyObject* run_code, PyObject* globals, PyObject* locals) {
     RE_StringInfo str_info;
 
     /* Get the string to search or match. */
@@ -18621,7 +18741,7 @@ Py_LOCAL_INLINE(BOOL) state_init(RE_State* state, PatternObject* pattern,
 
     if (!state_init_2(state, pattern, string, &str_info, start, end,
       overlapped, concurrent, partial, use_lock, visible_captures, match_all,
-      timeout, globals, locals)) {
+      timeout, run_code, globals, locals)) {
         release_buffer(&str_info);
         return FALSE;
     }
@@ -18725,6 +18845,8 @@ Py_LOCAL_INLINE(void) state_fini(RE_State* state) {
     re_dealloc(state->fuzzy_changes.items);
 
     Py_DECREF(state->pattern);
+    Py_DECREF(state->globals);
+    Py_DECREF(state->locals);
     Py_DECREF(state->string);
 
     if (state->should_release)
@@ -20558,103 +20680,193 @@ static PyTypeObject Match_Type = {
 
 /* Deallocates a StateObject. */
 static void state_dealloc(PyObject* self_) {
-	StateObject* self;
-	
-	self = (StateObject*)self_;
-	
-	Py_DECREF(self->match);
-	PyObject_DEL(self);
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    Py_XDECREF(self->match);
+    PyObject_DEL(self);
 }
 
 /* StateObject's 'group' method. */
 static PyObject* state_group(StateObject* self, PyObject* args) {
-	return match_group(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_group(self->match, args);
 }
 
 /* StateObject's 'start' method. */
 static PyObject* state_start(StateObject* self, PyObject* args) {
-	return match_start(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_start(self->match, args);
 }
 
 /* StateObject's 'end' method. */
 static PyObject* state_end(StateObject* self, PyObject* args) {
-	return match_end(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_end(self->match, args);
 }
 
 /* StateObject's 'span' method. */
 static PyObject* state_span(StateObject* self, PyObject* args) {
-	return match_span(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_span(self->match, args);
 }
 
 /* StateObject's 'groups' method. */
 static PyObject* state_groups(StateObject* self, PyObject* args, PyObject*
   kwargs) {
-	return match_groups(self->match, args, kwargs);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_groups(self->match, args, kwargs);
 }
 
 /* StateObject's 'groupdict' method. */
 static PyObject* state_groupdict(StateObject* self, PyObject* args, PyObject*
   kwargs) {
-	return match_groupdict(self->match, args, kwargs);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_groupdict(self->match, args, kwargs);
 }
 
 /* StateObject's 'capturesdict' method. */
 static PyObject* state_capturesdict(StateObject* self) {
-	return match_capturesdict(self->match);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_capturesdict(self->match);
 }
 
 /* StateObject's 'expand' method. */
 static PyObject* state_expand(StateObject* self, PyObject* args) {
-	return match_expand(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_expand(self->match, args);
 }
 
 /* StateObject's 'expandf' method. */
 static PyObject* state_expandf(StateObject* self, PyObject* args) {
-	return match_expandf(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_expandf(self->match, args);
 }
 
 /* StateObject's 'captures' method. */
 static PyObject* state_captures(StateObject* self, PyObject* args) {
-	return match_captures(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_captures(self->match, args);
 }
 
 /* StateObject's 'allcaptures' method. */
 static PyObject* state_allcaptures(StateObject* self) {
-	return match_allcaptures(self->match);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_allcaptures(self->match);
 }
 
 /* StateObject's 'starts' method. */
 static PyObject* state_starts(StateObject* self, PyObject* args) {
-	return match_starts(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_starts(self->match, args);
 }
 
 /* StateObject's 'ends' method. */
 static PyObject* state_ends(StateObject* self, PyObject* args) {
-	return match_ends(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_ends(self->match, args);
 }
 
 /* StateObject's 'spans' method. */
 static PyObject* state_spans(StateObject* self, PyObject* args) {
-	return match_spans(self->match, args);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_spans(self->match, args);
 }
 
 /* StateObject's 'allspans' method. */
 static PyObject* state_allspans(StateObject* self) {
-	return match_allspans(self->match);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_allspans(self->match);
 }
 
 /* StateObject's 'detach_string' method. */
 static PyObject* state_detach_string(StateObject* self) {
-	return match_detach_string(self->match, NULL);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_detach_string(self->match, NULL);
 }
 
 /* StateObject's length method. */
 Py_LOCAL_INLINE(Py_ssize_t) state_length(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return -1;
+    }
+
     return (Py_ssize_t)self->match->group_count + 1;
 }
 
 /* StateObject's '__getitem__' method. */
 static PyObject* state_getitem(StateObject* self, PyObject* item) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
     if (PySlice_Check(item))
         return match_get_group_slice(self->match, item);
 
@@ -20666,6 +20878,11 @@ static PyObject* state_getitem(StateObject* self, PyObject* item) {
  * It actually doesn't make a copy, just returns the original object.
  */
 Py_LOCAL_INLINE(PyObject*) make_state_copy(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
     Py_INCREF(self);
     return (PyObject*)self;
 }
@@ -20686,37 +20903,81 @@ Py_LOCAL_INLINE(BOOL) append_integer(PyObject* list, Py_ssize_t value);
 
 /* StateObject's '__repr__' method. */
 static PyObject* state_repr(PyObject* self_) {
-	PyObject* list;
-	PyObject* separator;
-	PyObject* result;
-	
-	list = PyList_New(0);
-	if (!list)
-		return NULL;
-		
-	if (!append_string(list, "<regex.State object at "))
-		goto error;
-	
-	if (!append_integer(list, (Py_ssize_t)self_))
-		goto error;
-		
-	if (!append_string(list, ">"))
-		goto error;
-		
-	separator = Py_BuildValue("U", "");
-	if (!separator)
-		goto error;
-		
-	result = PyUnicode_Join(separator, list);
-	Py_DECREF(separator);
-	Py_DECREF(list);
-	
-	return result;
+    PyObject* list;
+    PyObject* separator;
+    PyObject* result;
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    list = PyList_New(0);
+    if (!list)
+        return NULL;
+
+    if (!append_string(list, "<regex.State object at "))
+        goto error;
+
+    if (!append_integer(list, (Py_ssize_t)self))
+        goto error;
+
+    if (self->valid)
+        if (!append_string(list, "; valid>")) {
+            goto error;
+        }
+    else if (!append_string(list, "; invalid>"))
+        goto error;
+
+    separator = Py_BuildValue("U", "");
+    if (!separator)
+        goto error;
+
+    result = PyUnicode_Join(separator, list);
+    Py_DECREF(separator);
+    Py_DECREF(list);
+
+    return result;
 
 error:
-	Py_DECREF(list);
-	return NULL;
+    Py_DECREF(list);
+    return NULL;
 }
+
+/* StateObject's 'advance' method. */
+static PyObject* state_advance(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    self->advance = TRUE;
+
+    Py_RETURN_NONE;
+}
+
+/* StateObject's 'fail' method. */
+static PyObject* state_fail(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    self->advance = FALSE;
+
+    Py_RETURN_NONE;
+}
+
+PyDoc_STRVAR(state_advance_doc,
+  "advance() --> None.\n\
+  Causes the engine to advance after the execution of code ends.");
+
+PyDoc_STRVAR(state_fail_doc,
+  "fail() --> None.\n\
+  Causes the engine to backtrack after the execution of code ends.");
 
 /* MatchObject's methods. */
 static PyMethodDef state_methods[] = {
@@ -20742,6 +21003,8 @@ static PyMethodDef state_methods[] = {
     {"allspans", (PyCFunction)state_allspans, METH_NOARGS, match_allspans_doc},
     {"detach_string", (PyCFunction)state_detach_string, METH_NOARGS,
       match_detach_string_doc},
+    {"advance", (PyCFunction)state_advance, METH_NOARGS, state_advance_doc},
+    {"fail", (PyCFunction)state_fail, METH_NOARGS, state_fail_doc},
     {"__copy__", (PyCFunction)state_copy, METH_NOARGS},
     {"__deepcopy__", (PyCFunction)state_deepcopy, METH_O},
     {"__getitem__", (PyCFunction)state_getitem, METH_O|METH_COEXIST},
@@ -20754,360 +21017,625 @@ static PyMethodDef state_methods[] = {
 
 PyDoc_STRVAR(state_doc, "State object");
 
-/* Getter of StateObject's 'failure' attribute. */
-static PyObject* state_get_failure(StateObject* self, void* unused) {
-	if (self->failure)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+/* StateObject's 'advancing' attribute. */
+static PyObject* state_advancing(StateObject* self, void* unused) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->advance)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
-/* Setter of StateObject's 'failure' attribute. */
-static int state_set_failure(StateObject* self, PyObject* value, void* unused) {
-	if (!value) {
-		set_error(RE_ERROR_DELETE, NULL);
-		return -1;
-	}
-	
-	self->failure = PyObject_IsTrue(value);
-	return 0;
+/* StateObject's 'in_conditional' attribute. */
+static PyObject* state_in_conditional(StateObject* self, void* unused) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->in_conditional)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 're' attribute. */
 static PyObject* state_pattern(StateObject* self, void* unused) {
-	Py_INCREF(self->state->pattern);
-	return (PyObject*)self->state->pattern;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    Py_INCREF(self->state->pattern);
+    return (PyObject*)self->state->pattern;
 }
 
 /* StateObject's 'string' attribute. */
 static PyObject* state_string(StateObject* self, void* unused) {
-	return match_string((PyObject*)self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_string((PyObject*)self->match, unused);
 }
 
 /* StateObject's 'lastindex' attribute. */
 static PyObject* state_lastindex(StateObject* self, void* unused) {
-	return match_lastindex((PyObject*)self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_lastindex((PyObject*)self->match, unused);
 }
 
 /* StateObject's 'lastgroup' attribute. */
 static PyObject* state_lastgroup(StateObject* self, void* unused) {
-	return match_lastgroup((PyObject*)self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_lastgroup((PyObject*)self->match, unused);
 }
 
 /* StateObject's 'regs' attribute. */
 static PyObject* state_regs(StateObject* self, void* unused) {
-	return match_regs(self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_regs(self->match, unused);
 }
 
 /* StateObject's 'fuzzy_counts' attribute. */
 static PyObject* state_fuzzy_counts(StateObject* self, void* unused) {
-	return match_fuzzy_counts((PyObject*)self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_fuzzy_counts((PyObject*)self->match, unused);
 }
 
 /* StateObject's 'fuzzy_changes' attribute. */
 static PyObject* state_fuzzy_changes(StateObject* self, void* unused) {
-	return match_fuzzy_changes((PyObject*)self->match, unused);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return match_fuzzy_changes((PyObject*)self->match, unused);
 }
 
 /* StateObject's 'pos' attribute. */
 static PyObject* state_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->match->pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->match->pos);
 }
 
 /* StateObject's 'endpos' attribute. */
 static PyObject* state_endpos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->match->endpos);
-}
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
 
-/* StateObject's 'partial' attribute. */
-static PyObject* state_partial(StateObject* self, void* unused) {
-	/* Match object is explicitly created with RE_ERROR_SUCCESS. */
-	Py_RETURN_FALSE;
+    return Py_BuildValue("n", self->match->endpos);
 }
 
 /* StateObject's 'globals' attribute. */
 static PyObject* state_globals(StateObject* self, void* unused) {
-	Py_INCREF(self->state->globals);
-	return self->state->globals;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    Py_INCREF(self->state->globals);
+    return self->state->globals;
 }
 
 /* StateObject's 'locals' attribute. */
 static PyObject* state_locals(StateObject* self, void* unused) {
-	Py_INCREF(self->state->locals);
-	return self->state->locals;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    Py_INCREF(self->state->locals);
+    return self->state->locals;
 }
 
 /* StateObject's 'charsize' attribute. */
 static PyObject* state_charsize(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->charsize);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->charsize);
 }
 
 /* StateObject's 'text_length' attribute. */
 static PyObject* state_text_length(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->text_length);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->text_length);
 }
 
 /* StateObject's 'slice_start' attribute. */
 static PyObject* state_slice_start(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->slice_start);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->slice_start);
 }
 
 /* StateObject's 'slice_end' attribute. */
 static PyObject* state_slice_end(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->slice_end);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->slice_end);
 }
 
 /* StateObject's 'text_start' attribute. */
 static PyObject* state_text_start(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->text_start);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->text_start);
 }
 
 /* StateObject's 'text_end' attribute. */
 static PyObject* state_text_end(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->text_end);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->text_end);
 }
 
 /* StateObject's 'search_anchor' attribute. */
 static PyObject* state_search_anchor(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->search_anchor);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->search_anchor);
 }
 
 /* StateObject's 'match_pos' attribute. */
 static PyObject* state_match_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->match_pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->match_pos);
 }
 
 /* StateObject's 'text_pos' attribute. */
 static PyObject* state_text_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->text_pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->text_pos);
 }
 
 /* StateObject's 'final_newline' attribute. */
 static PyObject* state_final_newline(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->final_newline);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->final_newline);
 }
 
 /* StateObject's 'final_line_sep' attribute. */
 static PyObject* state_final_line_sep(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->final_line_sep);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->final_line_sep);
 }
 
 /* StateObject's 'sstack' attribute. */
 static PyObject* state_sstack(StateObject* self, void* unused) {
-	return Py_BuildValue("nn", self->state->sstack.capacity,
-	  self->state->sstack.count);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("nn", self->state->sstack.capacity,
+      self->state->sstack.count);
 }
 
 /* StateObject's 'bstack' attribute. */
 static PyObject* state_bstack(StateObject* self, void* unused) {
-	return Py_BuildValue("nn", self->state->bstack.capacity,
-	  self->state->bstack.count);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("nn", self->state->bstack.capacity,
+      self->state->bstack.count);
 }
 
 /* StateObject's 'pstack' attribute. */
 static PyObject* state_pstack(StateObject* self, void* unused) {
-	return Py_BuildValue("nn", self->state->pstack.capacity,
-	  self->state->pstack.count);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("nn", self->state->pstack.capacity,
+      self->state->pstack.count);
 }
 
 /* StateObject's 'best_match_pos' attribute. */
 static PyObject* state_best_match_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->best_match_pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->best_match_pos);
 }
 
 /* StateObject's 'best_text_pos' attribute. */
 static PyObject* state_best_text_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->best_text_pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->best_text_pos);
 }
 
 /* StateObject's 'min_width' attribute. */
 static PyObject* state_min_width(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->min_width);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->min_width);
 }
 
 /* StateObject's 'total_errors' attribute. */
 static PyObject* state_total_errors(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->total_errors);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->total_errors);
 }
 
 /* StateObject's 'max_errors' attribute. */
 static PyObject* state_max_errors(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->max_errors);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->max_errors);
 }
 
 /* StateObject's 'fewest_errors' attribute. */
 static PyObject* state_fewest_errors(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->fewest_errors);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->fewest_errors);
 }
 
 /* StateObject's 'capture_change' attribute. */
 static PyObject* state_capture_change(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->capture_change);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->capture_change);
 }
 
 /* StateObject's 'req_pos' attribute. */
 static PyObject* state_req_pos(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->req_pos);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->req_pos);
 }
 
 /* StateObject's 'req_end' attribute. */
 static PyObject* state_req_end(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->req_end);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->req_end);
 }
 
 /* StateObject's 'timeout' attribute. */
 static PyObject* state_timeout(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->timeout);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("d", (double)self->state->timeout / CLOCKS_PER_SEC);
 }
 
 /* StateObject's 'start_time' attribute. */
 static PyObject* state_start_time(StateObject* self, void* unused) {
-	return Py_BuildValue("n", (float)self->state->start_time);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("d", (double)self->state->start_time / CLOCKS_PER_SEC);
 }
 
-/* StateObject's 'embedded_code_time' attribute. */
-static PyObject* state_embedded_code_time(StateObject* self, void* unused) {
-	return Py_BuildValue("n", (float)self->state->embedded_code_time);
+/* StateObject's 'execute_time' attribute. */
+static PyObject* state_execute_time(StateObject* self, void* unused) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("d", (double)self->state->execute_time / CLOCKS_PER_SEC);
 }
 
-/* StateObject's 'halted_time' attribute. */
-static PyObject* state_halted_time(StateObject* self, void* unused) {
-	return Py_BuildValue("n", (float)self->state->halted_time);
+/* StateObject's 'skipped_time' attribute. */
+static PyObject* state_skipped_time(StateObject* self, void* unused) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("d", (double)self->state->skipped_time / CLOCKS_PER_SEC);
 }
 
 /* StateObject's 'partial_side' attribute. */
 static PyObject* state_partial_side(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->partial_side);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->partial_side);
 }
 
 /* StateObject's 'iterations' attribute. */
 static PyObject* state_iterations(StateObject* self, void* unused) {
-	return Py_BuildValue("n", self->state->iterations);
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    return Py_BuildValue("n", self->state->iterations);
 }
 
 /* StateObject's 'is_unicode' attribute. */
 static PyObject* state_is_unicode(StateObject* self, void* unused) {
-	if (self->state->is_unicode)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->is_unicode)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'should_release' attribute. */
 static PyObject* state_should_release(StateObject* self, void* unused) {
-	if (self->state->should_release)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->should_release)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'overlapped' attribute. */
 static PyObject* state_overlapped(StateObject* self, void* unused) {
-	if (self->state->overlapped)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->overlapped)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'reverse' attribute. */
 static PyObject* state_reverse(StateObject* self, void* unused) {
-	if (self->state->reverse)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->reverse)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'visible_captures' attribute. */
 static PyObject* state_visible_captures(StateObject* self, void* unused) {
-	if (self->state->visible_captures)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->visible_captures)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'version_0' attribute. */
 static PyObject* state_version_0(StateObject* self, void* unused) {
-	if (self->state->version_0)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->version_0)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'must_advance' attribute. */
 static PyObject* state_must_advance(StateObject* self, void* unused) {
-	if (self->state->must_advance)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->must_advance)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'is_multithreaded' attribute. */
 static PyObject* state_is_multithreaded(StateObject* self, void* unused) {
-	if (self->state->is_multithreaded)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->is_multithreaded)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'too_few_errors' attribute. */
 static PyObject* state_too_few_errors(StateObject* self, void* unused) {
-	if (self->state->too_few_errors)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->too_few_errors)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'match_all' attribute. */
 static PyObject* state_match_all(StateObject* self, void* unused) {
-	if (self->state->match_all)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->match_all)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'found_match' attribute. */
 static PyObject* state_found_match(StateObject* self, void* unused) {
-	if (self->state->found_match)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->found_match)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'is_fuzzy' attribute. */
 static PyObject* state_is_fuzzy(StateObject* self, void* unused) {
-	if (self->state->is_fuzzy)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
-}
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
 
-/* StateObject's 'no_code' attribute. */
-static PyObject* state_no_code(StateObject* self, void* unused) {
-	if (self->state->no_code)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (self->state->is_fuzzy)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'backtracking' attribute. */
 static PyObject* state_backtracking(StateObject* self, void* unused) {
-	if (self->state->backtracking)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->backtracking)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'locked' attribute. */
 static PyObject* state_locked(StateObject* self, void* unused) {
-	if (self->state->locked)
-		Py_RETURN_TRUE;
-		
-	Py_RETURN_FALSE;
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->locked)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
 }
 
 static PyGetSetDef state_getset[] = {
-	{"failure", (getter)state_get_failure, (setter)state_set_failure,
-	  "Whether the embedded code failed."},
+    {"advancing", (getter)state_advancing, (setter)NULL,
+      "Whether the engine advances after execution ends."},
+    {"in_conditional", (getter)state_in_conditional, (setter)NULL,
+      "Whether the code is used as a conditional."},
     {"re", (getter)state_pattern, (setter)NULL,
       "The regex object that produced this match object."},
     {"string", (getter)state_string, (setter)NULL,
@@ -21126,8 +21654,6 @@ static PyGetSetDef state_getset[] = {
       "The position at which the regex engine starting searching."},
     {"endpos", (getter)state_endpos, (setter)NULL,
       "The final position beyond which the regex engine won't search."},
-    {"partial", (getter)state_partial, (setter)NULL,
-      "Whether it's a partial match."},
     {"globals", (getter)state_globals, (setter)NULL,
       "The global dict for embedded code."},
     {"locals", (getter)state_locals, (setter)NULL,
@@ -21179,12 +21705,12 @@ static PyGetSetDef state_getset[] = {
     {"req_end", (getter)state_req_end, (setter)NULL,
       "The end position where the required string matched."},
     {"timeout", (getter)state_timeout, (setter)NULL,
-      "The timeout in clock ticks."},
+      "The timeout in seconds."},
     {"start_time", (getter)state_start_time, (setter)NULL,
       "The clock time when matching started."},
-    {"embedded_code_time", (getter)state_embedded_code_time, (setter)NULL,
+    {"execute_time", (getter)state_execute_time, (setter)NULL,
       "The clock time when the embedded code is executed."},
-    {"halted_time", (getter)state_halted_time, (setter)NULL,
+    {"skipped_time", (getter)state_skipped_time, (setter)NULL,
       "Time spent waiting until the end of an embedded code."},
     {"partial_side", (getter)state_partial_side, (setter)NULL,
       "The side that could truncate in a partial match."},
@@ -21214,8 +21740,6 @@ static PyGetSetDef state_getset[] = {
       "Whether a POSIX match has been found."},
     {"is_fuzzy", (getter)state_is_fuzzy, (setter)NULL,
       "Whether the pattern is fuzzy."},
-    {"no_code", (getter)state_no_code, (setter)NULL,
-      "Whether to skip all embedded code."},
     {"backtracking", (getter)state_backtracking, (setter)NULL,
       "Whether the engine is backtracking."},
     {"locked", (getter)state_locked, (setter)NULL,
@@ -21224,9 +21748,9 @@ static PyGetSetDef state_getset[] = {
 };
 
 static PyMappingMethods state_as_mapping = {
-	(lenfunc)state_length, /* mp_length */
-	(binaryfunc)state_getitem, /* mp_subscript */
-	0, /* mp_ass_subscript */
+    (lenfunc)state_length, /* mp_length */
+    (binaryfunc)state_getitem, /* mp_subscript */
+    0, /* mp_ass_subscript */
 };
 
 /* Copies the groups. */
@@ -21490,6 +22014,11 @@ Py_LOCAL_INLINE(PyObject*) scanner_search_or_match(ScannerObject* self, BOOL
 
     state = &self->state;
 
+    if (state->locked) {
+        set_error(RE_ERROR_LOCKED, NULL);
+        return NULL;
+    }
+
     /* Acquire the state lock in case we're sharing the scanner object across
      * threads.
      */
@@ -21698,13 +22227,14 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
     PyObject* partial = Py_False;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "overlapped",
-      "concurrent", "partial", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOO:scanner", kwlist,
+      "concurrent", "partial", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOOO:scanner", kwlist,
       &string, &pos, &endpos, &overlapped, &concurrent, &partial, &timeout,
-      &globals, &locals))
+      &run_code, &globals, &locals))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -21725,6 +22255,18 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
 
     part = decode_partial(partial);
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     /* Create a scanner object. */
     self = PyObject_NEW(ScannerObject, &Scanner_Type);
     if (!self)
@@ -21736,7 +22278,7 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
 
     /* The MatchObject, and therefore repeated captures, will be visible. */
     if (!state_init(&self->state, pattern, string, start, end, overlapped != 0,
-      conc, part, TRUE, TRUE, FALSE, tim, globals, locals)) {
+      conc, part, TRUE, TRUE, FALSE, tim, run_code, globals, locals)) {
         Py_DECREF(self);
         return NULL;
     }
@@ -21752,6 +22294,11 @@ Py_LOCAL_INLINE(PyObject*) next_split_part(SplitterObject* self) {
     PyObject* result = NULL; /* Initialise to stop compiler warning. */
 
     state = &self->state;
+
+    if (state->locked) {
+        set_error(RE_ERROR_LOCKED, NULL);
+        return NULL;
+    }
 
     /* Acquire the state lock in case we're sharing the splitter object across
      * threads.
@@ -22196,12 +22743,13 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     Py_ssize_t maxsplit = 0;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "string", "maxsplit", "concurrent", "timeout",
-      "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOO:splitter", kwlist,
-      &string, &maxsplit, &concurrent, &timeout, &globals, &locals))
+      "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOO:splitter", kwlist,
+      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -22211,6 +22759,18 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
+
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
 
     /* Create a splitter object. */
     self = PyObject_NEW(SplitterObject, &Splitter_Type);
@@ -22227,7 +22787,7 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&self->state, pattern, string, 0, PY_SSIZE_T_MAX, FALSE,
-      conc, FALSE, TRUE, FALSE, FALSE, tim, globals, locals)) {
+      conc, FALSE, TRUE, FALSE, FALSE, tim, run_code, globals, locals)) {
         Py_DECREF(self);
         return NULL;
     }
@@ -22260,10 +22820,11 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
     PyObject* partial = Py_False;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "concurrent",
-      "partial", "timeout", "globals", "locals", NULL };
+      "partial", "timeout", "code", "globals", "locals", NULL };
     /* When working with a short string, such as a line from a file, the
      * relative cost of PyArg_ParseTupleAndKeywords can be significant, and
      * it's worth not using it when there are only positional arguments.
@@ -22274,7 +22835,7 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
     else
         arg_count = -1;
 
-    if (1 <= arg_count && arg_count <= 8) {
+    if (1 <= arg_count && arg_count <= 9) {
         /* PyTuple_GET_ITEM borrows the reference. */
         string = PyTuple_GET_ITEM(args, 0);
         if (arg_count >= 2)
@@ -22288,12 +22849,14 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
         if (arg_count >= 6)
             timeout = PyTuple_GET_ITEM(args, 5);
         if (arg_count >= 7)
-            globals = PyTuple_GET_ITEM(args, 6);
+            run_code = PyTuple_GET_ITEM(args, 6);
         if (arg_count >= 8)
-            locals = PyTuple_GET_ITEM(args, 7);
+            globals = PyTuple_GET_ITEM(args, 7);
+        if (arg_count >= 9)
+            locals = PyTuple_GET_ITEM(args, 8);
     } else if (!PyArg_ParseTupleAndKeywords(args, kwargs, args_desc, kwlist,
-      &string, &pos, &endpos, &concurrent, &partial, &timeout, &globals,
-      &locals))
+      &string, &pos, &endpos, &concurrent, &partial, &timeout, &run_code,
+      &globals, &locals))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -22314,9 +22877,21 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
 
     part = decode_partial(partial);
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     /* The MatchObject, and therefore repeated captures, will be visible. */
     if (!state_init(&state, self, string, start, end, FALSE, conc, part, FALSE,
-      TRUE, match_all, tim, globals, locals))
+      TRUE, match_all, tim, run_code, globals, locals))
         return NULL;
 
     status = do_match(&state, search);
@@ -22335,21 +22910,21 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
 /* PatternObject's 'match' method. */
 static PyObject* pattern_match(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOO:match", FALSE,
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:match", FALSE,
       FALSE);
 }
 
 /* PatternObject's 'fullmatch' method. */
 static PyObject* pattern_fullmatch(PatternObject* self, PyObject* args,
   PyObject* kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOO:fullmatch",
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:fullmatch",
       FALSE, TRUE);
 }
 
 /* PatternObject's 'search' method. */
 static PyObject* pattern_search(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOO:search", TRUE,
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:search", TRUE,
       FALSE);
 }
 
@@ -22455,8 +23030,8 @@ Py_LOCAL_INLINE(PyObject*) get_sub_replacement(PyObject* item, PyObject*
 /* PatternObject's 'subx' method. */
 Py_LOCAL_INLINE(PyObject*) pattern_subx(PatternObject* self, PyObject*
   str_template, PyObject* string, Py_ssize_t maxsub, int sub_type, PyObject*
-  pos, PyObject* endpos, int concurrent, Py_ssize_t timeout, PyObject* globals,
-  PyObject* locals) {
+  pos, PyObject* endpos, int concurrent, Py_ssize_t timeout, PyObject* run_code,
+  PyObject* globals, PyObject* locals) {
     RE_StringInfo str_info;
     Py_ssize_t start;
     Py_ssize_t end;
@@ -22580,7 +23155,7 @@ Py_LOCAL_INLINE(PyObject*) pattern_subx(PatternObject* self, PyObject*
      */
     if (!state_init_2(&state, self, string, &str_info, start, end, FALSE,
       concurrent, FALSE, FALSE, is_callable || (sub_type & RE_SUBF) != 0,
-      FALSE, timeout, globals, locals)) {
+      FALSE, timeout, run_code, globals, locals)) {
         release_buffer(&str_info);
         Py_XDECREF(replacement);
         return NULL;
@@ -22847,13 +23422,14 @@ static PyObject* pattern_sub(PatternObject* self, PyObject* args, PyObject*
     PyObject* endpos = Py_None;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "repl", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOO:sub", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:sub", kwlist,
       &replacement, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &globals, &locals))
+      &run_code, &globals, &locals))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -22864,8 +23440,20 @@ static PyObject* pattern_sub(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     return pattern_subx(self, replacement, string, count, RE_SUB, pos, endpos,
-      conc, tim, globals, locals);
+      conc, tim, run_code, globals, locals);
 }
 
 /* PatternObject's 'subf' method. */
@@ -22881,13 +23469,14 @@ static PyObject* pattern_subf(PatternObject* self, PyObject* args, PyObject*
     PyObject* endpos = Py_None;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "format", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOO:sub", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:sub", kwlist,
       &format, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &globals, &locals))
+      &run_code, &globals, &locals))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -22898,8 +23487,20 @@ static PyObject* pattern_subf(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     return pattern_subx(self, format, string, count, RE_SUBF, pos, endpos,
-      conc, tim, globals, locals);
+      conc, tim, run_code, globals, locals);
 }
 
 /* PatternObject's 'subn' method. */
@@ -22915,13 +23516,14 @@ static PyObject* pattern_subn(PatternObject* self, PyObject* args, PyObject*
     PyObject* endpos = Py_None;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "repl", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOO:subn", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:subn", kwlist,
       &replacement, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &globals, &locals))
+      &run_code, &globals, &locals))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -22932,8 +23534,20 @@ static PyObject* pattern_subn(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     return pattern_subx(self, replacement, string, count, RE_SUBN, pos, endpos,
-      conc, tim, globals, locals);
+      conc, tim, run_code, globals, locals);
 }
 
 /* PatternObject's 'subfn' method. */
@@ -22949,13 +23563,14 @@ static PyObject* pattern_subfn(PatternObject* self, PyObject* args, PyObject*
     PyObject* endpos = Py_None;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "format", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOO:subn", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:subn", kwlist,
       &format, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &globals, &locals))
+      &run_code, &globals, &locals))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -22966,8 +23581,20 @@ static PyObject* pattern_subfn(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     return pattern_subx(self, format, string, count, RE_SUBF | RE_SUBN, pos,
-      endpos, conc, tim, globals, locals);
+      endpos, conc, tim, run_code, globals, locals);
 }
 
 /* PatternObject's 'split' method. */
@@ -22992,12 +23619,13 @@ static PyObject* pattern_split(PatternObject* self, PyObject* args, PyObject*
     Py_ssize_t maxsplit = 0;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
     static char* kwlist[] = { "string", "maxsplit", "concurrent", "timeout",
-      "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOO:split", kwlist,
-      &string, &maxsplit, &concurrent, &timeout, &globals, &locals))
+      "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOO:split", kwlist,
+      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals))
         return NULL;
 
     if (maxsplit == 0)
@@ -23011,10 +23639,22 @@ static PyObject* pattern_split(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&state, self, string, 0, PY_SSIZE_T_MAX, FALSE, conc,
-      FALSE, FALSE, FALSE, FALSE, tim, globals, locals))
+      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals))
         return NULL;
 
     list = PyList_New(0);
@@ -23166,13 +23806,14 @@ static PyObject* pattern_findall(PatternObject* self, PyObject* args, PyObject*
     Py_ssize_t overlapped = FALSE;
     PyObject* concurrent = Py_None;
     PyObject* timeout = Py_None;
+    PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
-    PyObject* locals = Py_None; 
+    PyObject* locals = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "overlapped",
-      "concurrent", "timeout", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOO:findall", kwlist,
-      &string, &pos, &endpos, &overlapped, &concurrent, &timeout, &globals,
-      &locals))
+      "concurrent", "timeout", "code", "globals", "locals", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOO:findall", kwlist,
+      &string, &pos, &endpos, &overlapped, &concurrent, &timeout, &run_code,
+      &globals, &locals))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -23191,10 +23832,22 @@ static PyObject* pattern_findall(PatternObject* self, PyObject* args, PyObject*
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
 
+    if (run_code != Py_None)
+        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
+
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return NULL;
+    }
+
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&state, self, string, start, end, overlapped != 0, conc,
-      FALSE, FALSE, FALSE, FALSE, tim, globals, locals))
+      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals))
         return NULL;
 
     list = PyList_New(0);
@@ -23339,63 +23992,63 @@ static PyObject* pattern_sizeof(PatternObject* self, PyObject* args) {
 
 /* The documentation of a PatternObject. */
 PyDoc_STRVAR(pattern_match_doc,
-    "match(string, pos=None, endpos=None, concurrent=None, timeout=None) --> MatchObject or None.\n\
+    "match(string, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> MatchObject or None.\n\
     Match zero or more characters at the beginning of the string.");
 
 PyDoc_STRVAR(pattern_fullmatch_doc,
-    "fullmatch(string, pos=None, endpos=None, concurrent=None, timeout=None) --> MatchObject or None.\n\
+    "fullmatch(string, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> MatchObject or None.\n\
     Match zero or more characters against all of the string.");
 
 PyDoc_STRVAR(pattern_search_doc,
-    "search(string, pos=None, endpos=None, concurrent=None, timeout=None) --> MatchObject or None.\n\
+    "search(string, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> MatchObject or None.\n\
     Search through string looking for a match, and return a corresponding\n\
     match object instance.  Return None if no match is found.");
 
 PyDoc_STRVAR(pattern_sub_doc,
-    "sub(repl, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None) --> newstring\n\
+    "sub(repl, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> newstring\n\
     Return the string obtained by replacing the leftmost (or rightmost with a\n\
     reverse pattern) non-overlapping occurrences of pattern in string by the\n\
     replacement repl.");
 
 PyDoc_STRVAR(pattern_subf_doc,
-    "subf(format, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None) --> newstring\n\
+    "subf(format, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> newstring\n\
     Return the string obtained by replacing the leftmost (or rightmost with a\n\
     reverse pattern) non-overlapping occurrences of pattern in string by the\n\
     replacement format.");
 
 PyDoc_STRVAR(pattern_subn_doc,
-    "subn(repl, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None) --> (newstring, number of subs)\n\
+    "subn(repl, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> (newstring, number of subs)\n\
     Return the tuple (new_string, number_of_subs_made) found by replacing the\n\
     leftmost (or rightmost with a reverse pattern) non-overlapping occurrences\n\
     of pattern with the replacement repl.");
 
 PyDoc_STRVAR(pattern_subfn_doc,
-    "subfn(format, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None) --> (newstring, number of subs)\n\
+    "subfn(format, string, count=0, flags=0, pos=None, endpos=None, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> (newstring, number of subs)\n\
     Return the tuple (new_string, number_of_subs_made) found by replacing the\n\
     leftmost (or rightmost with a reverse pattern) non-overlapping occurrences\n\
     of pattern with the replacement format.");
 
 PyDoc_STRVAR(pattern_split_doc,
-    "split(string, maxsplit=0, concurrent=None, timeout=None) --> list.\n\
+    "split(string, maxsplit=0, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> list.\n\
     Split string by the occurrences of pattern.");
 
 PyDoc_STRVAR(pattern_splititer_doc,
-    "splititer(string, maxsplit=0, concurrent=None, timeout=None) --> iterator.\n\
+    "splititer(string, maxsplit=0, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> iterator.\n\
     Return an iterator yielding the parts of a split string.");
 
 PyDoc_STRVAR(pattern_findall_doc,
-    "findall(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None) --> list.\n\
+    "findall(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> list.\n\
     Return a list of all matches of pattern in string.  The matches may be\n\
     overlapped if overlapped is True.");
 
 PyDoc_STRVAR(pattern_finditer_doc,
-    "finditer(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None) --> iterator.\n\
+    "finditer(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> iterator.\n\
     Return an iterator over all matches for the RE pattern in string.  The\n\
     matches may be overlapped if overlapped is True.  For each match, the\n\
     iterator returns a MatchObject.");
 
 PyDoc_STRVAR(pattern_scanner_doc,
-    "scanner(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None) --> scanner.\n\
+    "scanner(string, pos=None, endpos=None, overlapped=False, concurrent=None, timeout=None, code=None, globals=None, locals=None) --> scanner.\n\
     Return an scanner for the RE pattern in string.  The matches may be overlapped\n\
     if overlapped is True.");
 
@@ -23474,15 +24127,22 @@ static void pattern_dealloc(PyObject* self_) {
 
     re_dealloc(self->stack_storage);
 
+    if (self->code_count) {
+        for (i = 0; i < self->code_count; i++)
+            Py_XDECREF(self->compiled_code);
+
+        re_dealloc(self->compiled_code);
+    }
+
     if (self->weakreflist)
         PyObject_ClearWeakRefs((PyObject*)self);
-    Py_XDECREF(self->module);
-    Py_XDECREF(self->globals);
-    Py_XDECREF(self->locals);
-    Py_XDECREF(self->embedded_code);
     Py_XDECREF(self->pattern);
+    Py_XDECREF(self->module);
     Py_XDECREF(self->groupindex);
     Py_XDECREF(self->indexgroup);
+    Py_XDECREF(self->globals);
+    Py_XDECREF(self->locals);
+    Py_XDECREF(self->code);
 
     for (partial_side = 0; partial_side < 2; partial_side++) {
         if (self->partial_named_lists[partial_side]) {
@@ -23511,17 +24171,19 @@ typedef struct RE_FlagName {
 static RE_FlagName flag_names[] = {
     {"A", RE_FLAG_ASCII},
     {"B", RE_FLAG_BESTMATCH},
+    {"C", RE_FLAG_CODE},
     {"D", RE_FLAG_DEBUG},
     {"S", RE_FLAG_DOTALL},
     {"F", RE_FLAG_FULLCASE},
+    {"H", RE_FLAG_HALT_TIMER},
     {"I", RE_FLAG_IGNORECASE},
     {"L", RE_FLAG_LOCALE},
     {"M", RE_FLAG_MULTILINE},
+    {"N", RE_FLAG_NO_CODE},
     {"P", RE_FLAG_POSIX},
     {"R", RE_FLAG_REVERSE},
     {"T", RE_FLAG_TEMPLATE},
     {"X", RE_FLAG_VERBOSE},
-    {"XX", RE_FLAG_FULLVERBOSE},
     {"V0", RE_FLAG_VERSION0},
     {"V1", RE_FLAG_VERSION1},
     {"W", RE_FLAG_WORD},
@@ -23873,6 +24535,85 @@ static PyObject* pattern_groupindex(PyObject* self_) {
     return PyDict_Copy(self->groupindex);
 }
 
+/* PatternObject's 'run_code' getter method. */
+static PyObject* pattern_run_code_get(PyObject* self_) {
+    PatternObject* self;
+
+    self = (PatternObject*)self_;
+
+    return Py_BuildValue("n", self->flags & RE_FLAG_CODE);
+}
+
+/* PatternObject's 'run_code' setter method. */
+static int pattern_run_code_set(PyObject* self_, PyObject* value) {
+    PatternObject* self;
+
+    self = (PatternObject*)self_;
+
+    if (PyObject_IsTrue(value))
+        self->flags |= RE_FLAG_CODE;
+    else
+        self->flags |= ~RE_FLAG_CODE;
+
+    return 0;
+}
+
+/* PatternObject's 'globals' getter method. */
+static PyObject* pattern_globals_get(PyObject* self_) {
+    PatternObject* self;
+
+    self = (PatternObject*)self_;
+
+    Py_INCREF(self->globals);
+    return self->globals;
+}
+
+/* PatternObject's 'globals' setter method. */
+static int pattern_globals_set(PyObject* self_, PyObject* value) {
+    PatternObject* self;
+
+    if (!PyDict_Check(value)) {
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        return -1;
+    }
+
+    self = (PatternObject*)self_;
+
+    Py_DECREF(self->globals);
+    self->globals = value;
+    Py_INCREF(self->globals);
+
+    return 0;
+}
+
+/* PatternObject's 'locals' getter method. */
+static PyObject* pattern_locals_get(PyObject* self_) {
+    PatternObject* self;
+
+    self = (PatternObject*)self_;
+
+    Py_INCREF(self->locals);
+    return self->locals;
+}
+
+/* PatternObject's 'locals' setter method. */
+static int pattern_locals_set(PyObject* self_, PyObject* value) {
+    PatternObject* self;
+
+    if (!PyMapping_Check(value)) {
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        return -1;
+    }
+
+    self = (PatternObject*)self_;
+
+    Py_DECREF(self->locals);
+    self->locals = value;
+    Py_INCREF(self->locals);
+
+    return 0;
+}
+
 /* PatternObject's '_pickled_data' method. */
 static PyObject* pattern_pickled_data(PyObject* self_) {
     PatternObject* self;
@@ -23880,12 +24621,17 @@ static PyObject* pattern_pickled_data(PyObject* self_) {
 
     self = (PatternObject*)self_;
 
-    /* Build the data needed for picking. */
-    pickled_data = Py_BuildValue("OnOOOOOnOnnOOO", self->pattern, self->flags,
-      self->packed_code_list, self->groupindex, self->indexgroup,
-      self->named_lists, self->named_list_indexes, self->req_offset,
-      self->required_chars, self->req_flags, self->public_group_count,
-      self->embedded_code, Py_None, Py_None);
+    /* Build the data needed for picking.
+     * The code flag is unset to avoid arbitrary code execution after
+     * unpickling and running unknown regex.
+     * Globals and locals are set to None to avoid pickling unrelated data and
+     * because they're usually just references.
+     */
+    pickled_data = Py_BuildValue("OnOOOOOnOnnOOO", self->pattern,
+      self->flags & ~RE_FLAG_CODE, self->packed_code_list, self->groupindex,
+      self->indexgroup, self->named_lists, self->named_list_indexes,
+      self->req_offset, self->required_chars, self->req_flags,
+      self->public_group_count, self->code, Py_None, Py_None);
 
     return pickled_data;
 }
@@ -23893,6 +24639,12 @@ static PyObject* pattern_pickled_data(PyObject* self_) {
 static PyGetSetDef pattern_getset[] = {
     {"groupindex", (getter)pattern_groupindex, (setter)NULL,
       "A dictionary mapping group names to group numbers."},
+    {"run_code", (getter)pattern_run_code_get, (setter)pattern_run_code_set,
+      "Whether to run or skip embedded code."},
+    {"globals", (getter)pattern_globals_get, (setter)pattern_globals_set,
+      "The global dict used for embedded code."},
+    {"locals", (getter)pattern_locals_get, (setter)pattern_locals_set,
+      "The local dict used for embedded code."},
     {"_pickled_data", (getter)pattern_pickled_data, (setter)NULL,
       "Data used for pickling."},
     {NULL} /* Sentinel */
@@ -23907,6 +24659,8 @@ static PyMemberDef pattern_members[] = {
       READONLY, "The number of capturing groups in the pattern."},
     {"named_lists", T_OBJECT, offsetof(PatternObject, named_lists), READONLY,
       "The named lists used by the regex."},
+    {"code", T_OBJECT, offsetof(PatternObject, code), READONLY,
+      "The python code used by the regex."},
     {NULL} /* Sentinel */
 };
 
@@ -25328,6 +26082,126 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
     return RE_ERROR_SUCCESS;
 }
 
+/* Builds an EXEC_CODE node. */
+Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
+    RE_Node* node;
+
+    /* codes: opcode, code_id, halt_timer. */
+    if (args->code + 2 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    int flags = 0;
+    if (args->forward)
+        flags |= RE_STATUS_REVERSE;
+
+    /* Create the node. */
+    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 2);
+    if (!node)
+        return RE_ERROR_MEMORY;
+
+    node->values[0] = args->code[1];
+    node->values[1] = args->code[2];
+
+    args->code += 3;
+
+    /* Append the node. */
+    add_node(args->end, node);
+    args->end = node;
+
+    return RE_ERROR_SUCCESS;
+}
+
+/* Builds an EXEC_CODE_CONDITIONAL node. */
+Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
+    RE_Node* start_node;
+    RE_Node* end_node;
+    RE_CompileArgs subargs;
+    int status;
+    Py_ssize_t min_width;
+
+    /* codes: opcode, code_id, halt_timer, ..., next, ..., end. */
+    if (args->code + 3 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    int flags = 0;
+    if (args->forward)
+        flags |= RE_STATUS_REVERSE;
+
+    /* Create nodes for the start and end of the structure. */
+    start_node = create_node(args->pattern, RE_OP_EXEC_CODE_CONDITIONAL, flags, 0, 2);
+    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    if (!start_node || !end_node)
+        return RE_ERROR_MEMORY;
+
+    start_node->values[0] = args->code[1];
+    start_node->values[1] = args->code[2];
+
+    args->code += 3;
+
+    subargs = *args;
+    status = build_sequence(&subargs);
+    if (status != RE_ERROR_SUCCESS)
+        return status;
+
+    args->code = subargs.code;
+    args->has_captures |= subargs.has_captures;
+    args->is_fuzzy |= subargs.is_fuzzy;
+    args->has_groups |= subargs.has_groups;
+    args->has_repeats |= subargs.has_repeats;
+    args->visible_capture_count = subargs.visible_capture_count;
+
+    min_width = subargs.min_width;
+
+    /* Append the start node. */
+    add_node(args->end, start_node);
+    add_node(start_node, subargs.start);
+
+    if (args->code[0] == RE_OP_NEXT) {
+        RE_Node* true_branch_end;
+
+        ++args->code;
+
+        true_branch_end = subargs.end;
+
+        subargs.code = args->code;
+
+        status = build_sequence(&subargs);
+        if (status != RE_ERROR_SUCCESS)
+            return status;
+
+        args->code = subargs.code;
+        args->has_captures |= subargs.has_captures;
+        args->is_fuzzy |= subargs.is_fuzzy;
+        args->has_groups |= subargs.has_groups;
+        args->has_repeats |= subargs.has_repeats;
+        args->visible_capture_count = subargs.visible_capture_count;
+
+        min_width = min_ssize_t(min_width, subargs.min_width);
+
+        add_node(start_node, subargs.start);
+        add_node(true_branch_end, end_node);
+
+        add_node(subargs.end, end_node);
+    } else {
+        add_node(start_node, end_node);
+        add_node(subargs.end, end_node);
+
+        min_width = 0;
+    }
+
+    args->min_width += min_width;
+
+    if (args->code[0] != RE_OP_END)
+        return RE_ERROR_ILLEGAL;
+
+    ++args->code;
+
+    args->end = end_node;
+    args->all_atomic = FALSE;
+
+    return RE_ERROR_SUCCESS;
+}
+
 /* Builds a CONDITIONAL node. */
 Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     RE_CODE flags;
@@ -25459,31 +26333,6 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     args->all_atomic = FALSE;
 
     return RE_ERROR_SUCCESS;
-}
-
-/* Builds a EMBEDDED_CODE node. */
-Py_LOCAL_INLINE(int) build_EMBEDDED_CODE(RE_CompileArgs* args) {
-	RE_Node* node;
-	
-	/* codes: opcode, code_id, halt_time. */
-	if (args->code + 2 > args->end_code)
-		return RE_ERROR_ILLEGAL;
-	
-	/* Create the node. */
-	node = create_node(args->pattern, RE_OP_EMBEDDED_CODE, 0, 0, 2);
-	if (!node)
-		return RE_ERROR_MEMORY;
-	
-	node->values[0] = args->code[1];
-	node->values[1] = args->code[2];
-	
-	args->code += 3;
-	
-	/* Append the node. */
-	add_node(args->end, node);
-	args->end = node;
-	
-	return RE_ERROR_SUCCESS;
 }
 
 /* Builds a GROUP node. */
@@ -26368,15 +27217,23 @@ Py_LOCAL_INLINE(int) build_sequence(RE_CompileArgs* args) {
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
-        case RE_OP_CONDITIONAL:
-            /* A lookaround conditional. */
-            status = build_CONDITIONAL(args);
+        case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_ADV:
+        case RE_OP_EXEC_CODE_REV:
+            /* Embedded python code. */
+            status = build_EXEC_CODE(args);
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
-        case RE_OP_EMBEDDED_CODE:
-            /* Embedded python code. */
-            status = build_EMBEDDED_CODE(args);
+        case RE_OP_EXEC_CODE_CONDITIONAL:
+            /* Embedded python code conditional. */
+            status = build_EXEC_CODE_CONDITIONAL(args);
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+            break;
+        case RE_OP_CONDITIONAL:
+            /* A lookaround conditional. */
+            status = build_CONDITIONAL(args);
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
@@ -26686,6 +27543,8 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     PyObject* embedded_code;
     PyObject* globals;
     PyObject* locals;
+    size_t code_count;
+    PyObject** compiled_code;
     BOOL unpacked;
     Py_ssize_t code_len;
     RE_CODE* code;
@@ -26745,6 +27604,38 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
             goto error;
     }
 
+    /* Assert valid globals and locals. */
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        re_dealloc(code);
+        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+        if (unpacked)
+            Py_DECREF(code_list);
+        return NULL;
+    }
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        re_dealloc(code);
+        set_error(RE_ERROR_BAD_LOCALS, NULL);
+        if (unpacked)
+            Py_DECREF(code_list);
+        return NULL;
+    }
+
+    /* Allocate memory for compiled code. */
+    code_count = (size_t)PyTuple_GET_SIZE(embedded_code);
+    if (code_count) {
+        compiled_code = (PyObject**)re_alloc(code_count * sizeof(PyObject*));
+        if (!compiled_code) {
+            re_dealloc(code);
+            set_error(RE_ERROR_MEMORY, NULL);
+            if (unpacked)
+                Py_DECREF(code_list);
+            return NULL;
+        }
+
+        memset(compiled_code, 0, code_count * sizeof(PyObject*));
+    } else
+        compiled_code = NULL;
+
     /* Get the required characters. */
     get_required_chars(required_chars, &req_chars, &req_length);
 
@@ -26775,11 +27666,8 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     }
 
     /* Initialise the PatternObject. */
-    self->module = self_;
     self->pattern = pattern;
-    self->globals = globals;
-    self->locals = locals;
-    self->embedded_code = embedded_code;
+    self->module = self_;
     self->flags = flags;
     self->packed_code_list = packed_code_list;
     self->weakreflist = NULL;
@@ -26791,6 +27679,11 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->group_end_index = 0;
     self->groupindex = groupindex;
     self->indexgroup = indexgroup;
+    self->code = embedded_code;
+    self->globals = globals;
+    self->locals = locals;
+    self->code_count = code_count;
+    self->compiled_code = compiled_code;
     self->named_lists = named_lists;
     self->named_lists_count = (size_t)PyDict_Size(named_lists);
     self->partial_named_lists[0] = NULL;
@@ -26816,16 +27709,16 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->req_flags = req_flags;
     self->req_string = NULL;
     self->locale_info = NULL;
-    Py_INCREF(self->module);
     Py_INCREF(self->pattern);
-    Py_INCREF(self->globals);
-    Py_INCREF(self->locals);
-    Py_INCREF(self->embedded_code);
+    Py_INCREF(self->module);
     if (unpacked) {
         Py_INCREF(self->packed_code_list);
     }
     Py_INCREF(self->groupindex);
     Py_INCREF(self->indexgroup);
+    Py_INCREF(self->globals);
+    Py_INCREF(self->locals);
+    Py_INCREF(self->code);
     Py_INCREF(self->named_lists);
     Py_INCREF(self->named_list_indexes);
     Py_INCREF(self->required_chars);
@@ -27384,7 +28277,7 @@ PyMODINIT_FUNC PyInit__regex(void) {
     Match_Type.tp_methods = match_methods;
     Match_Type.tp_members = match_members;
     Match_Type.tp_getset = match_getset;
-    
+
     /* Initialise State_Type. */
     State_Type.tp_dealloc = state_dealloc;
     State_Type.tp_repr = state_repr;
@@ -27458,7 +28351,7 @@ PyMODINIT_FUNC PyInit__regex(void) {
         PyDict_SetItemString(d, "copyright", x);
         Py_DECREF(x);
     }
-    
+
     PyDict_SetItemString(d, "state", Py_None);
 
     /* Initialise the property dictionary. */
