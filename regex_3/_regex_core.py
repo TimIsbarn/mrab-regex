@@ -14,9 +14,7 @@
 # 2010-01-16 mrab Python front-end re-written and extended
 
 import enum
-import inspect
 import string
-import traceback
 
 import unicodedata
 from collections import defaultdict
@@ -899,37 +897,37 @@ def parse_paren(source, info):
             # (?&...: a call to a named group.
             return parse_call_named_group(source, info, saved_pos_2)
         if ch == "{":
-            # (?{...: embedded python code.
-            return parse_embedded_code(source, info)
+            # (?{...: code.
+            return parse_code(source, info)
         if ch == "+" and source.match("{"):
             # (?+{...: advancing code.
-            return parse_embedded_code(source, info, backtrack=False)
+            return parse_code(source, info, backtrack=False)
         if ch == "-" and source.match("{"):
             # (?-{...: backtracking code.
-            return parse_embedded_code(source, info, False)
+            return parse_code(source, info, False)
         if ch == "C":
             saved_pos_3 = source.pos
             saved_ch = ch
             ch = source.get()
             if ch == "=":
                 # (?C=...: code reference.
-                return parse_embedded_code_ref(source, info)
+                return parse_code_ref(source, info)
             if ch == "+":
                 # (?C+...: advancing code reference.
-                return parse_embedded_code_ref(source, info, backtrack=False)
+                return parse_code_ref(source, info, backtrack=False)
             if ch == "-":
                 # (?C-...: backtracking code reference.
-                return parse_embedded_code_ref(source, info, False)
+                return parse_code_ref(source, info, False)
             source.pos = saved_pos_3
             ch = saved_ch
         if ch == "?":
             ch = source.get()
             if ch == "{":
                 # (??{...: evaluated code.
-                return parse_embedded_code_eval(source, info, start_pos)
+                return parse_code_eval(source, info, start_pos)
             if ch == "C" and source.match("="):
                 # (??C=...: evaluated code reference.
-                return parse_embedded_code_ref_eval(source, info, start_pos)
+                return parse_code_ref_eval(source, info, start_pos)
 
         # (?...: probably a flags subpattern.
         source.pos = saved_pos_2
@@ -940,28 +938,28 @@ def parse_paren(source, info):
         saved_pos_2 = source.pos
         ch = source.get(True)
         if ch == "{":
-            # (*{...: optimistic python code.
-            return parse_embedded_code(source, info, optimistic=True)
+            # (*{...: optimistic code.
+            return parse_code(source, info, optimistic=True)
         if ch == "+" and source.match("{"):
             # (*+{...: optimistic advancing code.
-            return parse_embedded_code(source, info, backtrack=False,
+            return parse_code(source, info, backtrack=False,
               optimistic=True)
         if ch == "-" and source.match("{"):
             # (*-{...: optimistic backtracking code.
-            return parse_embedded_code(source, info, False,
+            return parse_code(source, info, False,
               optimistic=True)
         if ch == "C":
             ch = source.get(True)
             if ch == "=":
                 # (*C=...: optimistic code reference.
-                return parse_embedded_code_ref(source, info, optimistic=True)
+                return parse_code_ref(source, info, optimistic=True)
             if ch == "+":
                 # (*C+...: optimistic advancing code reference.
-                return parse_embedded_code_ref(source, info, backtrack=False,
+                return parse_code_ref(source, info, backtrack=False,
                   optimistic=True)
             if ch == "-":
                 # (*C-...: optimistic backtracking code reference.
-                return parse_embedded_code_ref(source, info, False,
+                return parse_code_ref(source, info, False,
                   optimistic=True)
 
         source.pos = saved_pos_2
@@ -1194,7 +1192,7 @@ def parse_code_name(source, reference=False):
 
     return name
 
-def parse_code(source):
+def parse_code_text(source):
     "Parses python code."
     prefix = ""
 
@@ -1277,11 +1275,11 @@ def parse_code(source):
 
     return text
 
-def parse_embedded_code(source, info, advance=True, backtrack=True,
+def parse_code(source, info, advance=True, backtrack=True,
   optimistic=False):
     "Parses embedded python code."
     name = parse_code_name(source)
-    code = parse_code(source)
+    code = parse_code_text(source)
     source.expect("})")
 
     info.absolute_id += 1
@@ -1294,13 +1292,13 @@ def parse_embedded_code(source, info, advance=True, backtrack=True,
     if code_id < 0 or (not advance and not backtrack):
         return Sequence()
 
-    return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER), advance,
+    return Code(code_id, bool(info.flags & HALT_TIMER), advance,
       backtrack, optimistic)
 
-def parse_embedded_code_eval(source, info, pos):
+def parse_code_eval(source, info, pos):
     "Parses and evaluates python code."
     name = parse_code_name(source)
-    code = parse_code(source)
+    code = parse_code_text(source)
     source.expect("})")
 
     no_code = info.flags & NO_CODE
@@ -1321,14 +1319,14 @@ def parse_embedded_code_eval(source, info, pos):
 
     if no_code or not name:
         # Code isn't stored in info.
-        return EmbeddedCodeEval(info.flags, code, id, pos, source.pos,
+        return CodeEval(info.flags, code, id, pos, source.pos,
           source.depth.copy())
 
     # For better dump message, reference the stored code instead.
-    return EmbeddedCodeRefEval(info.flags, name, id, pos, source.pos,
+    return CodeRefEval(info.flags, name, id, pos, source.pos,
       source.depth.copy())
 
-def parse_embedded_code_ref(source, info, advance=True, backtrack=True,
+def parse_code_ref(source, info, advance=True, backtrack=True,
   optimistic=False):
     "Parses an embedded python code reference."
     saved_pos = source.pos
@@ -1344,15 +1342,15 @@ def parse_embedded_code_ref(source, info, advance=True, backtrack=True,
     if code_id is not None:
         if code_id < 0:
             return Sequence()
-        return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER), advance,
+        return Code(code_id, bool(info.flags & HALT_TIMER), advance,
           backtrack, optimistic)
 
     info.evaluated_code = True
 
-    return EmbeddedCodeRef(name, bool(info.flags & HALT_TIMER), advance,
+    return CodeRef(name, bool(info.flags & HALT_TIMER), advance,
       backtrack, optimistic, saved_pos, source.depth.copy())
 
-def parse_embedded_code_ref_eval(source, info, pos):
+def parse_code_ref_eval(source, info, pos):
     "Parses and evaluates a python code reference."
     name = parse_code_name(source, True)
     source.expect(")")
@@ -1366,13 +1364,13 @@ def parse_embedded_code_ref_eval(source, info, pos):
     info.evaluated_code = True
 
     # Ensure evaluation of code from left to right.
-    return EmbeddedCodeRefEval(info.flags, name, id, pos, source.pos,
+    return CodeRefEval(info.flags, name, id, pos, source.pos,
       source.depth.copy())
 
 def parse_code_conditional(source, info, optimistic=False):
     "Parses a code conditional."
     name = parse_code_name(source)
-    code = parse_code(source)
+    code = parse_code_text(source)
     source.expect("})")
 
     yes_item = None
@@ -1418,10 +1416,10 @@ def parse_code_conditional(source, info, optimistic=False):
         return no_conditional()
 
     if yes_item.is_empty() and no_item.is_empty():
-        return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER),
+        return Code(code_id, bool(info.flags & HALT_TIMER),
           True, False, optimistic)
 
-    return EmbeddedCodeConditional(code_id, bool(info.flags & HALT_TIMER),
+    return CodeConditional(code_id, bool(info.flags & HALT_TIMER),
       yes_item, no_item, optimistic)
 
 def parse_code_conditional_ref(source, info, optimistic=False):
@@ -1465,13 +1463,13 @@ def parse_code_conditional_ref(source, info, optimistic=False):
             return no_conditional()
 
         if yes_item.is_empty() and no_item.is_empty():
-            return EmbeddedCode(code_id, bool(info.flags & HALT_TIMER),
+            return Code(code_id, bool(info.flags & HALT_TIMER),
               True, False, optimistic)
 
-        return EmbeddedCodeConditional(code_id, bool(info.flags & HALT_TIMER),
+        return CodeConditional(code_id, bool(info.flags & HALT_TIMER),
           yes_item, no_item, optimistic)
 
-    return EmbeddedCodeRefConditional(name, bool(info.flags & HALT_TIMER),
+    return CodeRefConditional(name, bool(info.flags & HALT_TIMER),
       yes_item, no_item, optimistic, saved_pos, source.depth.copy())
 
 def evaluate_code(source, info, code):
@@ -3077,6 +3075,261 @@ class Character(RegexBase):
 
         return 0, self
 
+class Code(RegexBase):
+    _opcode = {(True, True, False): OP.EXEC_CODE, (True, False, False):
+      OP.EXEC_CODE_ADV, (False, True, False): OP.EXEC_CODE_REV, (True, True,
+      True): OP.EXEC_CODE_OPT, (True, False, True): OP.EXEC_CODE_ADV_OPT,
+      (False, True, True): OP.EXEC_CODE_REV_OPT}
+
+    def __init__(self, code_id, halt_timer, advance, backtrack, optimistic):
+        RegexBase.__init__(self)
+        self.code_id = code_id
+        self.halt_timer = halt_timer
+        self.advance = advance
+        self.backtrack = backtrack
+        self.optimistic = optimistic
+
+        self._key = (self.__class__, self.code_id, self.halt_timer, self.advance,
+          self.backtrack, self.optimistic)
+
+    def get_firstset(self, reverse):
+        if self.optimistic:
+            return set([None])
+
+        raise _FirstSetError()
+
+    def _compile(self, reverse, fuzzy):
+        op = self._opcode.get((self.advance, self.backtrack, self.optimistic))
+        if op is None:
+            return []
+        
+        return [(op, self.code_id, int(self.halt_timer))]
+
+    def dump(self, indent, reverse):
+        halt = " HALT_TIMER" if self.halt_timer else ""
+        if self.advance:
+            adv = "BIDIRECTIONAL" if self.backtrack else "ADVANCE"
+        else:
+            adv = "BACKTRACK"
+        opt = " OPTIMISTIC" if self.optimistic else ""
+        print("{}EMBEDDED_CODE {}{} {}{}".format(INDENT * indent,
+          self.code_id, halt, adv, opt))
+
+    def max_width(self):
+        return 0
+
+    def get_required_string(self, reverse):
+        if self.optimistic:
+            return self.max_width(), None
+
+        raise _RequiredStringError()
+
+class CodeRef(RegexBase):
+    def __init__(self, name, halt_timer, advance, backtrack, optimistic,
+      position, depth):
+        RegexBase.__init__(self)
+        self.name = name
+        self.halt_timer = halt_timer
+        self.advance = advance
+        self.backtrack = backtrack
+        self.optimistic = optimistic
+        self.position = position
+        self.depth = depth
+
+        self._key = (self.__class__, self.name, self.halt_timer,
+          self.advance, self.backtrack, self.optimistic)
+
+    def evaluate_code(self, source, info):
+        code_id = info.get_code_id(self.name)
+        if code_id is None:
+            raise error(f"unknown code reference: {name}", source.string,
+              self.position, self.depth)
+
+        return Code(code_id, self.halt_timer, self.advance, self.backtrack,
+          self.optimistic)
+
+    def dump(self, indent, reverse):
+        halt = " HALT_TIMER" if self.halt_timer else ""
+        if self.advance:
+            adv = "BIDIRECTIONAL" if self.backtrack else "ADVANCE"
+        else:
+            adv = "BACKTRACK"
+        opt = " OPTIMISTIC" if self.optimistic else ""
+        print("{}CODE_REF {}{} {}{}".format(INDENT * indent,
+          self.name, halt, adv, opt))
+
+class CodeEval(RegexBase):
+    def __init__(self, flags, code, code_id, start_pos, end_pos, depth):
+        RegexBase.__init__(self)
+        self.flags = flags
+        self.code = code
+        self.code_id = code_id
+        self.start_pos = start_pos
+        self.end_pos = end_pos
+        self.depth = depth
+
+        self._key = (self.__class__, self.flags, self.code, self.start_pos,
+          self.end_pos)
+
+    def evaluate_code(self, source, info):
+        self.start_pos += info.insertion_offset
+        self.end_pos += info.insertion_offset
+
+        return insert_code(source, info, self.flags, self.code, self.code_id,
+          self.start_pos, self.end_pos, self.depth)
+
+    def dump(self, indent, reverse):
+        print("{}CODE_REF_EVAL {}".format(INDENT * indent,
+          self.code_id))
+
+class CodeRefEval(RegexBase):
+    def __init__(self, flags, name, code_id, start_pos, end_pos, depth):
+        RegexBase.__init__(self)
+        self.flags = flags
+        self.name = name
+        self.code_id = code_id
+        self.start_pos = start_pos
+        self.end_pos = end_pos
+        self.depth = depth
+
+        self._key = (self.__class__, self.flags, self.name, self.start_pos,
+          self.end_pos)
+
+    def evaluate_code(self, source, info):
+        code_id = info.get_code_id(self.name)
+        if code_id is None:
+            raise error(f"unknown code reference: {self.name}",
+              source.string, self.start_pos, self.depth)
+
+        self.start_pos += info.insertion_offset
+        self.end_pos += info.insertion_offset
+
+        return insert_code(source, info, self.flags, info.code_text[code_id],
+          self.code_id, self.start_pos, self.end_pos, self.depth)
+
+class CodeConditional(RegexBase):
+    def __init__(self, code_id, halt_timer, yes_item, no_item, optimistic):
+        RegexBase.__init__(self)
+        self.code_id = code_id
+        self.halt_timer = halt_timer
+        self.yes_item = yes_item
+        self.no_item = no_item
+        self.optimistic = optimistic
+
+    def evaluate_code(self, source, info):
+        self.yes_item = self.yes_item.evaluate_code(source, info)
+        self.no_item = self.no_item.evaluate_code(source, info)
+        return self
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
+
+    def optimise(self, info, reverse):
+        yes_item = self.yes_item.optimise(info, reverse)
+        no_item = self.no_item.optimise(info, reverse)
+
+        return CodeConditional(self.code_id, self.halt_timer, yes_item,
+          no_item, self.optimistic)
+
+    def pack_characters(self, info):
+        self.yes_item = self.yes_item.pack_characters(info)
+        self.no_item = self.no_item.pack_characters(info)
+        return self
+
+    def remove_captures(self):
+        self.yes_item = self.yes_item.remove_captures()
+        self.no_item = self.no_item.remove_captures()
+
+    def is_atomic(self):
+        return self.yes_item.is_atomic() and self.no_item.is_atomic()
+
+    def can_be_affix(self):
+        return self.yes_item.can_be_affix() and self.no_item.can_be_affix()
+
+    def contains_group(self):
+        return self.yes_item.contains_group() or self.no_item.contains_group()
+
+    def get_firstset(self, reverse):
+        if self.optimistic:
+            return (self.yes_item.get_firstset(reverse) |
+              self.no_item.get_firstset(reverse))
+
+        raise _FirstSetError()
+
+    def _compile(self, reverse, fuzzy):
+        code = [(OP.EXEC_CODE_CONDITIONAL, self.code_id, int(self.halt_timer))]
+        code.extend(self.yes_item.compile(reverse, fuzzy))
+        add_code = self.no_item.compile(reverse, fuzzy)
+        if add_code:
+            code.append((OP.NEXT, ))
+            code.extend(add_code)
+
+        code.append((OP.END, ))
+
+        return code
+
+    def dump(self, indent, reverse):
+        halt = " HALT_TIMER" if self.halt_timer else ""
+        opt = " OPTIMISTIC" if self.optimistic else ""
+        print("{}CODE_CONDITIONAL {}{}{}".format(INDENT * indent,
+          self.code_id, halt, opt))
+        self.yes_item.dump(indent + 1, reverse)
+        if not self.no_item.is_empty():
+            print("{}OR".format(INDENT * indent))
+            self.no_item.dump(indent + 1, reverse)
+
+    def __eq__(self, other):
+        return type(self) is type(other) and (self.code_id, self.halt_timer,
+          self.yes_item, self.no_item, self.optimistic) == (other.code_id,
+          other.halt_timer, other.yes_item, other.no_item, other.optimistic)
+
+    def max_width(self):
+        return max(self.yes_item.max_width(), self.no_item.max_width())
+
+    def get_required_string(self, reverse):
+        if self.optimistic:
+            return self.max_width(), None
+
+        raise _RequiredStringError()
+
+class CodeRefConditional(RegexBase):
+    def __init__(self, name, halt_timer, yes_item, no_item, optimistic,
+      position, depth):
+        RegexBase.__init__(self)
+        self.name = name
+        self.halt_timer = halt_timer
+        self.yes_item = yes_item
+        self.no_item = no_item
+        self.optimistic = optimistic
+        self.position = position
+        self.depth = depth
+
+        self._key = (self.__class__, self.name, self.halt_timer, self.yes_item,
+          self.no_item, self.optimistic)
+
+    def evaluate_code(self, source, info):
+        code_id = info.get_code_id(self.name)
+        if code_id is None or code_id < 0:
+            raise error(f"unknown code reference: {name}", source.string,
+              self.position, self.depth)
+
+        yes_item = self.yes_item.evaluate_code(source, info)
+        no_item = self.no_item.evaluate_code(source, info)
+
+        return CodeConditional(code_id, self.halt_timer, yes_item,
+          no_item, self.optimistic)
+
+    def dump(self, indent, reverse):
+        halt = " HALT_TIMER" if self.halt_timer else ""
+        opt = " OPTIMISTIC" if self.optimistic else ""
+        print("{}CODE_REF_CONDITIONAL {}{}{}".format(INDENT * indent,
+          self.name, halt, opt))
+        self.yes_item.dump(indent + 1, reverse)
+        if not self.no_item.is_empty():
+            print("{}OR".format(INDENT * indent))
+            self.no_item.dump(indent + 1, reverse)
+
 class Conditional(RegexBase):
     def __init__(self, info, group, yes_item, no_item, position, depth):
         RegexBase.__init__(self)
@@ -3186,292 +3439,6 @@ class DefaultEndOfWord(ZeroWidthBase):
 class DefaultStartOfWord(ZeroWidthBase):
     _opcode = OP.DEFAULT_START_OF_WORD
     _op_name = "DEFAULT_START_OF_WORD"
-
-class EmbeddedCode(RegexBase):
-    _opcode = {(True, True, True): OP.EXEC_CODE_OPT, (True, False, True):
-      OP.EXEC_CODE_ADV_OPT, (False, True, True): OP.EXEC_CODE_REV_OPT, (True,
-      True, False): OP.EXEC_CODE, (True, False, False): OP.EXEC_CODE_ADV,
-      (False, True, False): OP.EXEC_CODE_REV}
-
-    def __init__(self, code_id, halt_timer, advance, backtrack, optimistic):
-        RegexBase.__init__(self)
-        self.code_id = code_id
-        self.halt_timer = halt_timer
-        self.advance = advance
-        self.backtrack = backtrack
-        self.optimistic = optimistic
-
-        self._key = (self.__class__, self.code_id, self.halt_timer, self.advance,
-          self.backtrack, self.optimistic)
-
-    def get_firstset(self, reverse):
-        if self.optimistic:
-            return set([None])
-
-        raise _FirstSetError()
-
-    def _compile(self, reverse, fuzzy):
-        op = self._opcode.get((self.advance, self.backtrack, self.optimistic))
-        if op is None:
-            raise error("illegal embedded code")
-        return [(op, self.code_id, int(self.halt_timer))]
-
-    def dump(self, indent, reverse):
-        if self.halt_timer:
-            halt = " HALT_TIMER"
-        else:
-            halt = ""
-        if self.advance:
-            if self.backtrack:
-                adv = "BIDIRECTIONAL"
-            else:
-                adv = "ADVANCE"
-        else:
-            adv = "BACKTRACK"
-        if self.optimistic:
-            opt = " OPTIMISTIC"
-        else:
-            opt = ""
-        print("{}EMBEDDED_CODE {}{} {}{}".format(INDENT * indent,
-          self.code_id, halt, adv, opt))
-
-    def max_width(self):
-        return 0
-
-    def get_required_string(self, reverse):
-        if self.optimistic:
-            return self.max_width(), None
-
-        raise _RequiredStringError()
-
-class EmbeddedCodeRef(RegexBase):
-    def __init__(self, name, halt_timer, advance, backtrack, optimistic,
-      position, depth):
-        RegexBase.__init__(self)
-        self.code_id = name
-        self.halt_timer = halt_timer
-        self.advance = advance
-        self.backtrack = backtrack
-        self.optimistic = optimistic
-        self.position = position
-        self.depth = depth
-
-        self._key = (self.__class__, self.code_id, self.halt_timer,
-          self.advance, self.backtrack, self.optimistic)
-
-    def evaluate_code(self, source, info):
-        name = self.code_id
-        self.code_id = info.get_code_id(self.code_id)
-        if self.code_id is None:
-            raise error(f"unknown code reference: {name}", source.string,
-              self.position, self.depth)
-
-        return EmbeddedCode(self.code_id, self.halt_timer, self.advance,
-          self.backtrack, self.optimistic)
-
-    def dump(self, indent, reverse):
-        if self.halt_timer:
-            halt = " HALT_TIMER"
-        else:
-            halt = ""
-        if self.advance:
-            if self.backtrack:
-                adv = "BIDIRECTIONAL"
-            else:
-                adv = "ADVANCE"
-        else:
-            adv = "BACKTRACK"
-        if self.optimistic:
-            opt = " OPTIMISTIC"
-        else:
-            opt = ""
-        print("{}EMBEDDED_CODE_REF {}{} {}{}".format(INDENT * indent,
-          self.code_id, halt, adv, opt))
-
-class EmbeddedCodeEval(RegexBase):
-    def __init__(self, flags, code, code_id, start_pos, end_pos, depth):
-        RegexBase.__init__(self)
-        self.flags = flags
-        self.code = code
-        self.code_id = code_id
-        self.start_pos = start_pos
-        self.end_pos = end_pos
-        self.depth = depth
-
-        self._key = (self.__class__, self.flags, self.code, self.start_pos,
-          self.end_pos)
-
-    def evaluate_code(self, source, info):
-        self.start_pos += info.insertion_offset
-        self.end_pos += info.insertion_offset
-
-        return insert_code(source, info, self.flags, self.code, self.code_id,
-          self.start_pos, self.end_pos, self.depth)
-
-    def dump(self, indent, reverse):
-        print("{}EMBEDDED_CODE_REF_EVAL {}".format(INDENT * indent,
-          self.code_id))
-
-class EmbeddedCodeRefEval(RegexBase):
-    def __init__(self, flags, name, code_id, start_pos, end_pos, depth):
-        RegexBase.__init__(self)
-        self.flags = flags
-        self.name = name
-        self.code_id = code_id
-        self.start_pos = start_pos
-        self.end_pos = end_pos
-        self.depth = depth
-
-        self._key = (self.__class__, self.flags, self.name, self.start_pos,
-          self.end_pos)
-
-    def evaluate_code(self, source, info):
-
-        code_id = info.get_code_id(self.name)
-        if code_id is None:
-            raise error(f"unknown code reference: {self.name}", source.string,
-              self.start_pos, self.depth)
-
-        self.start_pos += info.insertion_offset
-        self.end_pos += info.insertion_offset
-
-        return insert_code(source, info, self.flags, info.code_text[code_id],
-          self.code_id, self.start_pos, self.end_pos, self.depth)
-
-class EmbeddedCodeConditional(RegexBase):
-    def __init__(self, code_id, halt_timer, yes_item, no_item, optimistic):
-        RegexBase.__init__(self)
-        self.code_id = code_id
-        self.halt_timer = halt_timer
-        self.yes_item = yes_item
-        self.no_item = no_item
-        self.optimistic = optimistic
-
-    def evaluate_code(self, source, info):
-        self.yes_item = self.yes_item.evaluate_code(source, info)
-        self.no_item = self.no_item.evaluate_code(source, info)
-        return self
-
-    def fix_groups(self, pattern, reverse, fuzzy):
-        self.yes_item.fix_groups(pattern, reverse, fuzzy)
-        self.no_item.fix_groups(pattern, reverse, fuzzy)
-
-    def optimise(self, info, reverse):
-        yes_item = self.yes_item.optimise(info, reverse)
-        no_item = self.no_item.optimise(info, reverse)
-
-        return EmbeddedCodeConditional(self.code_id, self.halt_timer, yes_item,
-          no_item, self.optimistic)
-
-    def pack_characters(self, info):
-        self.yes_item = self.yes_item.pack_characters(info)
-        self.no_item = self.no_item.pack_characters(info)
-        return self
-
-    def remove_captures(self):
-        self.yes_item = self.yes_item.remove_captures()
-        self.no_item = self.no_item.remove_captures()
-
-    def is_atomic(self):
-        return self.yes_item.is_atomic() and self.no_item.is_atomic()
-
-    def can_be_affix(self):
-        return self.yes_item.can_be_affix() and self.no_item.can_be_affix()
-
-    def contains_group(self):
-        return self.yes_item.contains_group() or self.no_item.contains_group()
-
-    def get_firstset(self, reverse):
-        if self.optimistic:
-            return (self.yes_item.get_firstset(reverse) |
-              self.no_item.get_firstset(reverse))
-
-        raise _FirstSetError()
-
-    def _compile(self, reverse, fuzzy):
-        code = [(OP.EXEC_CODE_CONDITIONAL, self.code_id, int(self.halt_timer))]
-        code.extend(self.yes_item.compile(reverse, fuzzy))
-        add_code = self.no_item.compile(reverse, fuzzy)
-        if add_code:
-            code.append((OP.NEXT, ))
-            code.extend(add_code)
-
-        code.append((OP.END, ))
-
-        return code
-
-    def dump(self, indent, reverse):
-        if self.halt_timer:
-            halt = " HALT_TIMER"
-        else:
-            halt = ""
-        if self.optimistic:
-            opt = " OPTIMISTIC"
-        else:
-            opt = ""
-        print("{}CODE_CONDITIONAL {}{}{}".format(INDENT * indent,
-          self.code_id, halt, opt))
-        self.yes_item.dump(indent + 1, reverse)
-        if not self.no_item.is_empty():
-            print("{}OR".format(INDENT * indent))
-            self.no_item.dump(indent + 1, reverse)
-
-    def __eq__(self, other):
-        return type(self) is type(other) and (self.code_id, self.halt_timer,
-          self.yes_item, self.no_item, self.optimistic) == (other.code_id,
-          other.halt_timer, other.yes_item, other.no_item, other.optimistic)
-
-    def max_width(self):
-        return max(self.yes_item.max_width(), self.no_item.max_width())
-
-    def get_required_string(self, reverse):
-        if self.optimistic:
-            return self.max_width(), None
-
-        raise _RequiredStringError()
-
-class EmbeddedCodeRefConditional(RegexBase):
-    def __init__(self, name, halt_timer, yes_item, no_item, optimistic,
-      position, depth):
-        RegexBase.__init__(self)
-        self.name = name
-        self.halt_timer = halt_timer
-        self.yes_item = yes_item
-        self.no_item = no_item
-        self.optimistic = optimistic
-        self.position = position
-        self.depth = depth
-
-        self._key = (self.__class__, self.name, self.halt_timer, self.yes_item,
-          self.no_item, self.optimistic)
-
-    def evaluate_code(self, source, info):
-        code_id = info.get_code_id(self.name)
-        if code_id is None or code_id < 0:
-            raise error(f"unknown code reference: {name}", source.string,
-              self.position, self.depth)
-
-        yes_item = self.yes_item.evaluate_code(source, info)
-        no_item = self.no_item.evaluate_code(source, info)
-
-        return EmbeddedCodeConditional(code_id, self.halt_timer, yes_item,
-          no_item, self.optimistic)
-
-    def dump(self, indent, reverse):
-        if self.halt_timer:
-            halt = " HALT_TIMER"
-        else:
-            halt = ""
-        if self.optimistic:
-            opt = " OPTIMISTIC"
-        else:
-            opt = ""
-        print("{}CODE_REF_CONDITIONAL {}{}{}".format(INDENT * indent,
-          self.name, halt, opt))
-        self.yes_item.dump(indent + 1, reverse)
-        if not self.no_item.is_empty():
-            print("{}OR".format(INDENT * indent))
-            self.no_item.dump(indent + 1, reverse)
 
 class EndOfLine(ZeroWidthBase):
     _opcode = OP.END_OF_LINE

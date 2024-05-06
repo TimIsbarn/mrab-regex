@@ -4462,11 +4462,24 @@ thing
         def func(v):
             ls["bar"] = v
         ls = {"func": func}
-        pat = regex.compile(
-          """(?c)(?:foo(?{bar = 2})|bar(?{func(1)}))(?{if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4})""",
+        pat = regex.compile("""(?cx)
+        (?:
+            foo
+            (?{bar = 2})
+        |
+            bar
+            (?{func(1)})
+        )
+        (?{
+            if bar == 2:
+                baz = 3
+            else:
+                baz = 4
+        })
+        """,
           locals=ls)
         self.assertTupleEqual(pat.code, ("bar = 2", "func(1)",
-          "if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4"))
+          "if bar == 2:\n    baz = 3\nelse:\n    baz = 4"))
         self.assertDictEqual(pat.locals, ls)
         self.assertIsNone(pat.globals)
         self.assertTrue(bool(pat.fullmatch("foo")))
@@ -4474,7 +4487,7 @@ thing
         self.assertTrue(bool(pat.fullmatch("bar")))
         self.assertDictEqual(ls, {"func": func, "bar": 1, "baz": 4})
 
-        # Changing variables while matching and evaluation code while parsing.
+        # Changing variables while matching and evaluating code while parsing.
         idx = 1
         def func(s):
             nonlocal idx
