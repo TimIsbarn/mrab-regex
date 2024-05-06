@@ -95,27 +95,29 @@ The special characters are:
                         state can be gained via a call to the module function
                         state(). Calling state().advance() causes the engine to
                         advance, state().fail() causes backtracking. The current
-                        direction is accessible as state().backtracking. Can be
-                        used in conditionals. When using the VERBOSE flag, all
-                        whitespace before the first and after the last character
-                        is stripped, also the common whitespace prefix is
-                        removed.
+                        direction is accessible as state().backtracking. When
+                        using the VERBOSE flag, all whitespace before the first
+                        and after the last character is stripped, also the
+                        common whitespace prefix is removed.
     (?+{code})          Executes only on advancing.
     (?-{code})          Executes only on backtracking.
-    (?{name}{code})     The code executed by this can be referenced by name.
+    (?{name}{code})     The code executed can be referenced by name.
     (?+{name}{code})    Named code that is executed on advancing. 
     (?-{name}{code})    Named code that is executed on backtracking.
+    (*{code})           Same as (?{code}) but certain optimisations are not
+                        disabled.
+    (*+{code})          Executes only on advancing.
+    (*-{code})          Executes only on backtracking.
+    (*{name}{code})     The code executed can be referenced by name.
+    (*+{name}{code})    Named code that is executed on advancing.
+    (*-{name}{code})    Named code that is executed on backtracking.
     (?C=name)           Executes the referenced code with the given name.
-                        Can be used in conditionals.
     (?C+name)           Executes the referenced code on advancing.
     (?C-name)           Executes the referenced code on backtracking.
-    (??{code})          Runs the code immediately and inserts the result into
-                        the pattern.
-    (??{name}{code})    Same as above, but the code can be referenced by name.
-    (??C=name)          Executes the referenced code and inserts the result
-                        into the pattern. All ?? code blocks are run left to
-                        right, if code is referenced, that is not already
-                        declared, all other code blocks are deferred.
+    (*C=name)           Same as (?C=name) but certain optimisations are not
+                        disabled.
+    (*C+name)           Executes the referenced code on advancing.
+    (*C-name)           Executes the referenced code on backtracking.
     (?(?{code})yes|no)  Evaluates a single expression. If the code returns a
                         value other than None and evaluates to True, the
                         yes_item will attempt to match next, otherwise it will
@@ -124,6 +126,16 @@ The special characters are:
                         The code can also be named.
     (?(?C=name)yes|no)  Evaluates the code referenced by name, otherwise
                         identical to the above.
+    (?(*{code])yes|no)  Same as (?(?{code})yes|no) but certain optimisations
+                        are not disabled.
+    (?(*C=name)yes|no)  Evaluates the code referenced by name, otherwise
+                        identical to the above.
+    (??{code})          Evaluates the code and inserts the result into the
+                        pattern.
+    (??{name}{code})    Same as above, but the code can be referenced by name.
+    (??C=name)          Executes the referenced code and inserts the result
+                        into the pattern. All ?? code blocks are run left to
+                        right after the whole pattern is parsed.
 
 The fuzzy matching constraints are: "i" to permit insertions, "d" to permit
 deletions, "s" to permit substitutions, "e" to permit any of these. Limits are
@@ -248,6 +260,7 @@ these flags can also be set within an RE:
     F   f   FULLCASE      Use full case-folding when performing
                           case-insensitive matching in Unicode.
     H   h   HALT_TIMER    Pause the timeout when executing embedded code.
+                          Does not interrupt the embedded code.
     I   i   IGNORECASE    Perform case-insensitive matching.
     L   L   LOCALE        Make \w, \W, \b, \B, \d, and \D dependent on the
                           current locale. (One byte per character only.)
@@ -531,11 +544,6 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
   store):
     "Compiles a regular expression to a PatternObject."
 
-    if global_dict is None:
-        global_dict = {}
-    if local_dict is None:
-        local_dict = {}
-
     global DEFAULT_VERSION
     try:
         from regex import DEFAULT_VERSION
@@ -568,8 +576,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
     if cache_it:
         try:
             # Do we know what keyword arguments are needed?
-            gk = tuple(global_dict.keys())
-            lk = tuple(local_dict.keys())
+            gk = tuple((global_dict or {}).keys())
+            lk = tuple((local_dict or {}).keys())
             args_key = (pattern, type(pattern), flags, gk, lk)
             args_needed = _named_args[args_key]
 
@@ -616,16 +624,13 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
         caught_exception = None
         try:
             source = _Source(pattern)
+            #source.modified = source.string
             info = _Info(global_flags, source.char_type, kwargs, global_dict,
               local_dict)
+#            info.defer_code = True
             info.guess_encoding = guess_encoding
             source.ignore_space = bool(info.flags & VERBOSE)
             parsed = _parse_pattern(source, info)
-            if source.modified:
-                if isinstance(pattern, bytes):
-                    pattern = bytes(source.string, "latin-1")
-                else:
-                    pattern = source.string
             break
         except _UnscopedFlagSet:
             # Remember the global flags for the next attempt.
@@ -635,10 +640,20 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
 
         if caught_exception:
             raise error(caught_exception.msg, caught_exception.pattern,
-              caught_exception.pos)
+              caught_exception.pos, caught_exception.depth)
 
     if not source.at_end():
         raise error("unbalanced parenthesis", pattern, source.pos)
+
+    if info.evaluated_code:
+        parsed = parsed.evaluate_code(source, info)
+
+        if isinstance(pattern, bytes):
+            modified_pattern = bytes(source.modified, "latin-1")
+        else:
+            modified_pattern = source.modified
+    else:
+        modified_pattern = None
 
     # Check the global flags for conflicts.
     version = (info.flags & _ALL_VERSIONS) or DEFAULT_VERSION
@@ -672,7 +687,7 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
 
     if caught_exception:
         raise error(caught_exception.msg, caught_exception.pattern,
-          caught_exception.pos)
+          caught_exception.pos, caught_exception.depth)
 
     # Should we print the parsed pattern?
     if flags & DEBUG:
@@ -681,12 +696,6 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
     # Optimise the parsed pattern.
     parsed = parsed.optimise(info, reverse)
     parsed = parsed.pack_characters(info)
-
-    if source.modified:
-        if isinstance(pattern, bytes):
-            pattern = bytes(source.string, "latin-1")
-        else:
-            pattern = source.string
 
     # Get the required string.
     req_offset, req_chars, req_flags = _get_required_string(parsed, info.flags)
@@ -744,12 +753,17 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
 
     # Embedded code
     embedded_code = tuple(c for c in info.code_text.values() if c)
+    code_index = info.code_refs.copy()
 
+    # Whether to store the passed globals and locals in the pattern.
     if store:
         gs = global_dict
         ls = local_dict
     else:
         gs = ls = None
+
+    if modified_pattern is None:
+        modified_pattern = pattern
 
     # Create the PatternObject.
     #
@@ -758,7 +772,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
     # affect the code generation but _are_ needed by the PatternObject.
     compiled_pattern = _regex.compile(pattern, info.flags | version, code,
       info.group_index, index_group, named_lists, named_list_indexes,
-      req_offset, req_chars, req_flags, info.group_count, embedded_code, gs, ls)
+      req_offset, req_chars, req_flags, info.group_count, embedded_code, gs, ls,
+      modified_pattern, code_index)
 
     # Do we need to reduce the size of the cache?
     if len(_cache) >= _MAXCACHE:
@@ -834,7 +849,7 @@ def _compile_replacement_helper(pattern, template):
     return compiled
 
 # We define Pattern here after all the support objects have been defined.
-_pat = _compile("(?{State = type(state())})", CODE, False,
+_pat = _compile("(?c)(?{State = type(state())})", 0, False,
   {}, False, None, locals(), True)
 Pattern = type(_pat)
 Match = type(_pat.match(''))

@@ -4456,45 +4456,53 @@ thing
         ['\r\n', '\n', '\x0B', '\f', '\r', '\x85', '\u2028', '\u2029'])
       self.assertEqual(regex.findall(br'\R', b'\r\n\n\x0B\f\r\x85'), [b'\r\n',
         b'\n', b'\x0B', b'\f', b'\r'])
-        
+
     def test_embedded_code(self):
+        # Calling functions while matching.
         def func(v):
-            lcls["bar"] = v
-        lcls = {"func": func}
-        reg = regex.compile(
-          """(?:foo(?{bar = 2})|bar(?{func(1)}))(?{if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4})""",
-          regex.CODE, globals={}, locals=lcls)
-        # self.assertEqual(reg.code, ("bar = 2", "func(1)", "if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4"))
-        self.assertEqual(reg.locals, lcls)
-        self.assertEqual(reg.globals, {})
-        self.assertEqual(bool(reg.fullmatch("foo")), True)
-        # Builtins are automatically added to the globals.
-        # self.assertEqual(reg.globals, {"__builtins__": globals()["__builtins__"]})
-        self.assertEqual(lcls, {"func": func, "bar": 2, "baz": 3})
-        self.assertEqual(bool(reg.fullmatch("bar")), True)
-        self.assertEqual(lcls, {"func": func, "bar": 1, "baz": 4})
-        
+            ls["bar"] = v
+        ls = {"func": func}
+        pat = regex.compile(
+          """(?c)(?:foo(?{bar = 2})|bar(?{func(1)}))(?{if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4})""",
+          locals=ls)
+        self.assertTupleEqual(pat.code, ("bar = 2", "func(1)",
+          "if bar == 2:\n\tbaz = 3\nelse:\n\tbaz = 4"))
+        self.assertDictEqual(pat.locals, ls)
+        self.assertIsNone(pat.globals)
+        self.assertTrue(bool(pat.fullmatch("foo")))
+        self.assertDictEqual(ls, {"func": func, "bar": 2, "baz": 3})
+        self.assertTrue(bool(pat.fullmatch("bar")))
+        self.assertDictEqual(ls, {"func": func, "bar": 1, "baz": 4})
+
+        # Changing variables while matching and evaluation code while parsing.
         idx = 1
         def func(s):
             nonlocal idx
             res = s * idx
             idx += 1
             return res
-        self.assertEqual(regex.compile(
-          "(??C=foo) (??{foo}{f('a')}) (??C=foo)", regex.CODE,
-          locals={"f": func}).pattern, "a aa aaa")
+        pat = regex.compile("(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)",
+          locals={"f": func})
+        self.assertEqual(pat.pattern, "(?c)a aa aaa")
+        self.assertEqual(pat.original_pattern,
+          "(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)")
+        self.assertTupleEqual(pat.code, ("f('a')",))
+        self.assertDictEqual(pat.codeindex, {"foo": 0})
         self.assertEqual(idx, 4)
-        
-        reg = regex.compile(
-          "(?(?{if count == 2:\n\tregex.state().fail()})foo|bar)",
-          regex.CODE, globals={"regex": regex})
-        self.assertEqual(bool(reg.fullmatch("foo", locals={"count": 2})), False)
-        self.assertEqual(bool(reg.fullmatch("bar", locals={"count": 2})), True)
-        self.assertEqual(bool(reg.fullmatch("foo", locals={"count": 3})), True)
-        self.assertEqual(bool(reg.fullmatch("bar", locals={"count": 3})), False)
-        
+        self.assertTrue(bool(pat.match("a aa aaa")))
+
+        # Code conditionals.
+        pat = regex.compile(
+          "(?c)(?(?{if count == 2:\n\tregex.state().fail()})foo|bar)",
+          globals={"regex": regex})
+        self.assertFalse(bool(pat.fullmatch("foo", locals={"count": 2})))
+        self.assertTrue(bool(pat.fullmatch("bar", locals={"count": 2})))
+        self.assertTrue(bool(pat.fullmatch("foo", locals={"count": 3})))
+        self.assertFalse(bool(pat.fullmatch("bar", locals={"count": 3})))
+
+        # Get maximum depth of nested braces
         ls = {}
-        reg = regex.compile("""(?x)
+        pat = regex.compile("""(?cx)
         (?+{depth = max_depth = 0})
         (?<brace_pair>
             {
@@ -4514,15 +4522,14 @@ thing
                 $
             )
         )
-        """, regex.CODE, locals=ls)
-        self.assertEqual(bool(reg.fullmatch(
-          "{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{}}")), True)
-        self.assertEqual(ls, {"depth": 0, "max_depth": 7})
-        self.assertEqual(bool(reg.fullmatch(
-          "{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{")), True)
-        self.assertEqual(ls, {"depth": 2, "max_depth": 7})
-        
-        reg = regex.compile("""(?x)
+        """, locals=ls)
+        self.assertTrue(bool(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{}}")))
+        self.assertDictEqual(ls, {"depth": 0, "max_depth": 7})
+        self.assertTrue(bool(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{")))
+        self.assertDictEqual(ls, {"depth": 2, "max_depth": 7})
+
+        # 3 sequences of equal length consisting of different characters.
+        pat = regex.compile("""(?cx)
         ((.)\\2++)
         ((.)\\4+)
         (?+{
@@ -4544,30 +4551,43 @@ thing
                 s.fail()
             del s
         })
-        """, regex.CODE, globals={"regex": regex})
-        self.assertEqual(bool(reg.fullmatch("aabbcc")), True)
-        self.assertEqual(bool(reg.fullmatch("aabbc")), False)
-        self.assertEqual(bool(reg.fullmatch("aabcc")), False)
-        self.assertEqual(bool(reg.fullmatch("abbcc")), False)
-        
+        """, globals={"regex": regex})
+        self.assertTrue(bool(pat.fullmatch("aabbcc")))
+        self.assertFalse(bool(pat.fullmatch("aabbc")))
+        self.assertFalse(bool(pat.fullmatch("aabcc")))
+        self.assertFalse(bool(pat.fullmatch("abbcc")))
+
         # Ensure that globals, locals and CODE flag are unset upon pickling.
         ls = {"foo": True}
-        reg = regex.compile("(?{foo = False})bar", regex.CODE, locals=ls)
-        p = pickle.dumps(reg)
-        reg = pickle.loads(p)
-        #self.assertEqual(reg.locals, {})
-        reg.locals = ls
-        self.assertEqual(ls, {"foo": True})
-        reg.fullmatch("bar", code=True)
-        self.assertEqual(ls, {"foo": False})
-        
-        self.assertEqual(regex.compile("(?n)(?{foo = 2})").code, ())
+        pat = regex.compile("(?c)(?{foo = False})bar", globals=globals(),
+          locals=ls)
+        self.assertDictEqual(pat.locals, ls)
+        p = pickle.dumps(pat)
+        pat = pickle.loads(p)
+        self.assertIsNone(pat.globals)
+        self.assertIsNone(pat.locals)
+        self.assertFalse(pat.flags & regex.CODE)
+        pat.locals = ls
+        self.assertDictEqual(ls, {"foo": True})
+        pat.fullmatch("bar", code=True)
+        self.assertDictEqual(ls, {"foo": False})
+
+        # NO_CODE ignores parsed code.
+        self.assertTupleEqual(regex.compile("(?n)(?{foo = 2})").code, ())
         self.assertEqual(regex.compile("(??{\"foo = 2\"})").pattern,
           "(??{\"foo = 2\"})")
         self.assertEqual(regex.compile("(?c)(??{\"foo = 2\"})").pattern,
           "(?c)foo = 2")
-        
-        self.assertRaisesRegex(regex.error, "^cannot turn CODE flag on within evaluated code at position 8$",
+
+        # NO_CODE doesn't prevent evaluation.
+        pat = regex.compile("(?cn)(??{foo}{'abc'})")
+        self.assertTupleEqual(pat.code, ())
+        self.assertDictEqual(pat.codeindex, {})
+        self.assertEqual(pat.pattern, "(?cn)abc")
+
+        # Cannot turn CODE flag on within evaluated code. 
+        self.assertRaisesRegex(regex.error,
+          "^cannot turn CODE flag on within evaluated code at position 8\n\tin evaluated code 0 at position 4$",
           lambda: regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
           locals={"f": lambda: "(?c:(??{\"foo\"}))"}))
         self.assertEqual(regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
@@ -4575,15 +4595,48 @@ thing
           "(?c)(?-c:(??{\"foo\"}))")
         self.assertEqual(regex.compile("(?c)(??{f()})",
           locals={"f": lambda: "(??{\"foo\"})"}).pattern, "(?c)foo")
-        
-        self.assertRaisesRegex(regex.error, "^cannot turn NO_CODE flag off within evaluated code at position 8$",
-          lambda: regex.compile("(?c)(??{f\"(?n:{f()})\"})",
+
+        # Cannot turn NO_CODE flag off within evaluated code.
+        self.assertRaisesRegex(regex.error,
+          "^cannot turn NO_CODE flag off within evaluated code at position 4\n\tin evaluated code 0 at position 5$",
+          lambda: regex.compile("(?cn)(??{f()})",
           locals={"f": lambda: "(?-n:(??{\"foo\"}))"}))
-        self.assertEqual(regex.compile("(?c)(??{f\"(?n:{f()})\"})",
+        self.assertEqual(regex.compile("(?cn)(??{f()})",
           locals={"f": lambda: "(??{\"foo\"})"}).pattern,
-          "(?c)(?n:(??{\"foo\"}))")
-        
-        
+          "(?cn)foo")
+
+        # Optimistic code doesn't disable certain optimizations.
+        ls = {"c": 0}
+        self.assertTrue(bool(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+          "a", locals=ls)))
+        self.assertDictEqual(ls, {"c": 2})
+        ls["c"] = 0
+        self.assertFalse(bool(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+          "b", locals=ls)))
+        self.assertDictEqual(ls, {"c": 1})
+        ls["c"] = 0
+        self.assertFalse(bool(regex.match("(?c)(?C+foo)a(*{foo}{c += 1})",
+          "b", locals=ls)))
+        self.assertDictEqual(ls, {"c": 1})
+        ls["c"] = 0
+        self.assertFalse(bool(regex.match("(?c)(*C+foo)a(?{foo}{c += 1})",
+          "b", locals=ls)))
+        self.assertDictEqual(ls, {"c": 0})
+        ls["c"] = 0
+        self.assertFalse(bool(regex.match("(?c)abc(?+{c = 1})def",
+          "abc", locals=ls)))
+        self.assertDictEqual(ls, {"c": 0})
+        ls["c"] = 0
+        # Runs once despite the input string being shorter than the minimum width.
+        self.assertFalse(bool(regex.match("(?c)abc(*+{c = 1})def",
+          "abc", locals=ls)))
+        self.assertDictEqual(ls, {"c": 1})
+
+        # Correct nested error messages.
+        self.assertRaisesRegex(regex.error,
+          "^invalid group reference at position 3\n\tin evaluated code 0 at position 0\n\tin evaluated code 0 at position 4$",
+          lambda: regex.compile("(?c)(??{'(??{\"(?(2)abc)\"})'})"))
+
 def test_main():
     unittest.main(verbosity=2)
 

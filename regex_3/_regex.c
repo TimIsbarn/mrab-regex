@@ -35,7 +35,7 @@
  * other compatibility work.
  */
 
-//#define VERBOSE
+/* #define VERBOSE */
 
 #define RE_MEMORY_LIMIT 0x40000000
 
@@ -66,9 +66,9 @@
 #define TRACE_PY_GIL(X) acquire_GIL(state); TRACE_PY(X); release_GIL(state);
 Py_LOCAL_INLINE(void) TRACE_PY(PyObject* obj) {
     if (!obj)
-        printf("PyObject 0: <NULL>\n");
+        printf("PyObject ref:0 at NULL: <NULL>\n");
     else {
-        printf("PyObject %" PY_FORMAT_SIZE_T "d %p: ", Py_REFCNT(obj), obj);
+        printf("PyObject ref:%" PY_FORMAT_SIZE_T "d at %p: ", Py_REFCNT(obj), obj);
         PyObject_Print(obj, stdout, 0);
         printf("\n");
     }
@@ -140,7 +140,7 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_ERROR_BAD_TIMEOUT -15 /* "timeout" invalid. */
 #define RE_ERROR_TIMED_OUT -16 /* Matching has timed out. */
 #define RE_ERROR_LOCKED -17 /* Attempt to match on a locked state. */
-#define RE_ERROR_INVALID_STATE -18 /* Attempt to use an invalidate state object. */
+#define RE_ERROR_INVALID_STATE -18 /* Attempt to use an invalidated state object. */
 #define RE_ERROR_BAD_GLOBALS -19 /* Globals have to be a dict. */
 #define RE_ERROR_BAD_LOCALS -20 /* Locals has to support mapping. */
 
@@ -564,6 +564,7 @@ typedef struct RE_State {
 typedef struct PatternObject {
     PyObject_HEAD
     PyObject* pattern; /* Pattern source (or None). */
+    PyObject* modified_pattern; /* Pattern after insertions (or None). */
     PyObject* module; /* The _regex module. */
     Py_ssize_t flags; /* Flags used when compiling pattern source. */
     PyObject* packed_code_list;
@@ -583,6 +584,7 @@ typedef struct PatternObject {
     PyObject* locals; /* The local dict for embedded code. */
     size_t code_count;
     PyObject** compiled_code; /* Code that's already compiled. */
+    PyObject* codeindex;
     PyObject* named_lists;
     size_t named_lists_count;
     PyObject** partial_named_lists[2];
@@ -697,6 +699,7 @@ typedef struct RE_CompileArgs {
     BOOL has_repeats; /* Whether the subpattern contains repeats. */
     BOOL in_define; /* Whether we're in (?(DEFINE)...). */
     BOOL all_atomic; /* The sequence consists only of atomic items. */
+    BOOL locked_min_width; /* If TRUE, the min_width cannot be greater. */
 } RE_CompileArgs;
 
 /* The string slices which will be concatenated to make the result string of
@@ -20840,16 +20843,6 @@ static PyObject* state_allspans(StateObject* self) {
     return match_allspans(self->match);
 }
 
-/* StateObject's 'detach_string' method. */
-static PyObject* state_detach_string(StateObject* self) {
-    if (!self->valid) {
-        set_error(RE_ERROR_INVALID_STATE, NULL);
-        return NULL;
-    }
-
-    return match_detach_string(self->match, NULL);
-}
-
 /* StateObject's length method. */
 Py_LOCAL_INLINE(Py_ssize_t) state_length(StateObject* self) {
     if (!self->valid) {
@@ -21001,8 +20994,6 @@ static PyMethodDef state_methods[] = {
     {"ends", (PyCFunction)state_ends, METH_VARARGS, match_ends_doc},
     {"spans", (PyCFunction)state_spans, METH_VARARGS, match_spans_doc},
     {"allspans", (PyCFunction)state_allspans, METH_NOARGS, match_allspans_doc},
-    {"detach_string", (PyCFunction)state_detach_string, METH_NOARGS,
-      match_detach_string_doc},
     {"advance", (PyCFunction)state_advance, METH_NOARGS, state_advance_doc},
     {"fail", (PyCFunction)state_fail, METH_NOARGS, state_fail_doc},
     {"__copy__", (PyCFunction)state_copy, METH_NOARGS},
@@ -21636,10 +21627,10 @@ static PyGetSetDef state_getset[] = {
       "Whether the engine advances after execution ends."},
     {"in_conditional", (getter)state_in_conditional, (setter)NULL,
       "Whether the code is used as a conditional."},
-    {"re", (getter)state_pattern, (setter)NULL,
+    {"pattern", (getter)state_pattern, (setter)NULL,
       "The regex object that produced this match object."},
     {"string", (getter)state_string, (setter)NULL,
-      "The string that was searched, or None if it has been detached."},
+      "The string that was searched."},
     {"lastindex", (getter)state_lastindex, (setter)NULL,
       "The group number of the last matched capturing group, or -1."},
     {"lastgroup", (getter)state_lastgroup, (setter)NULL,
@@ -22910,8 +22901,8 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
 /* PatternObject's 'match' method. */
 static PyObject* pattern_match(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:match", FALSE,
-      FALSE);
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:match",
+      FALSE, FALSE);
 }
 
 /* PatternObject's 'fullmatch' method. */
@@ -22924,8 +22915,8 @@ static PyObject* pattern_fullmatch(PatternObject* self, PyObject* args,
 /* PatternObject's 'search' method. */
 static PyObject* pattern_search(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:search", TRUE,
-      FALSE);
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:search",
+      TRUE, FALSE);
 }
 
 /* Gets the limits of the matching. */
@@ -24137,12 +24128,14 @@ static void pattern_dealloc(PyObject* self_) {
     if (self->weakreflist)
         PyObject_ClearWeakRefs((PyObject*)self);
     Py_XDECREF(self->pattern);
+    Py_XDECREF(self->modified_pattern);
     Py_XDECREF(self->module);
     Py_XDECREF(self->groupindex);
     Py_XDECREF(self->indexgroup);
     Py_XDECREF(self->globals);
     Py_XDECREF(self->locals);
     Py_XDECREF(self->code);
+    Py_XDECREF(self->codeindex);
 
     for (partial_side = 0; partial_side < 2; partial_side++) {
         if (self->partial_named_lists[partial_side]) {
@@ -24558,6 +24551,15 @@ static int pattern_run_code_set(PyObject* self_, PyObject* value) {
     return 0;
 }
 
+/* PatternObject's 'codeindex' method. */
+static PyObject* pattern_codeindex(PyObject* self_) {
+    PatternObject* self;
+
+    self = (PatternObject*)self_;
+
+    return PyDict_Copy(self->codeindex);
+}
+
 /* PatternObject's 'globals' getter method. */
 static PyObject* pattern_globals_get(PyObject* self_) {
     PatternObject* self;
@@ -24627,11 +24629,12 @@ static PyObject* pattern_pickled_data(PyObject* self_) {
      * Globals and locals are set to None to avoid pickling unrelated data and
      * because they're usually just references.
      */
-    pickled_data = Py_BuildValue("OnOOOOOnOnnOOO", self->pattern,
+    pickled_data = Py_BuildValue("OnOOOOOnOnnOOOOO", self->pattern,
       self->flags & ~RE_FLAG_CODE, self->packed_code_list, self->groupindex,
       self->indexgroup, self->named_lists, self->named_list_indexes,
       self->req_offset, self->required_chars, self->req_flags,
-      self->public_group_count, self->code, Py_None, Py_None);
+      self->public_group_count, self->code, Py_None, Py_None,
+      self->modified_pattern, self->codeindex);
 
     return pickled_data;
 }
@@ -24641,6 +24644,8 @@ static PyGetSetDef pattern_getset[] = {
       "A dictionary mapping group names to group numbers."},
     {"run_code", (getter)pattern_run_code_get, (setter)pattern_run_code_set,
       "Whether to run or skip embedded code."},
+    {"codeindex", (getter)pattern_codeindex, (setter)NULL,
+      "A dictionary mapping code names to code indices."},
     {"globals", (getter)pattern_globals_get, (setter)pattern_globals_set,
       "The global dict used for embedded code."},
     {"locals", (getter)pattern_locals_get, (setter)pattern_locals_set,
@@ -24651,8 +24656,10 @@ static PyGetSetDef pattern_getset[] = {
 };
 
 static PyMemberDef pattern_members[] = {
-    {"pattern", T_OBJECT, offsetof(PatternObject, pattern), READONLY,
+    {"pattern", T_OBJECT, offsetof(PatternObject, modified_pattern), READONLY,
       "The pattern string from which the regex object was compiled."},
+    {"original_pattern", T_OBJECT, offsetof(PatternObject, pattern), READONLY,
+      "The pattern before it was parsed."},
     {"flags", T_PYSSIZET, offsetof(PatternObject, flags), READONLY,
       "The regex matching flags."},
     {"groups", T_PYSSIZET, offsetof(PatternObject, public_group_count),
@@ -25720,7 +25727,8 @@ Py_LOCAL_INLINE(int) build_ANY(RE_CompileArgs* args) {
     add_node(args->end, node);
     args->end = node;
 
-    ++args->min_width;
+    if (!args->locked_min_width)
+        ++args->min_width;
 
     return RE_ERROR_SUCCESS;
 }
@@ -25800,12 +25808,14 @@ Py_LOCAL_INLINE(int) build_FUZZY(RE_CompileArgs* args) {
         return RE_ERROR_ILLEGAL;
 
     args->code = subargs.code;
-    args->min_width += subargs.min_width;
+    if (!args->locked_min_width)
+        args->min_width += subargs.min_width;
     args->has_captures |= subargs.has_captures;
     args->is_fuzzy = TRUE;
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     ++args->code;
 
@@ -25854,12 +25864,14 @@ Py_LOCAL_INLINE(int) build_ATOMIC(RE_CompileArgs* args) {
         return RE_ERROR_ILLEGAL;
 
     args->code = subargs.code;
-    args->min_width += subargs.min_width;
+    if (!args->locked_min_width)
+        args->min_width += subargs.min_width;
     args->has_captures |= subargs.has_captures;
     args->is_fuzzy |= subargs.is_fuzzy;
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     ++args->code;
 
@@ -25916,6 +25928,7 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
     RE_Node* branch_node;
     RE_Node* join_node;
     Py_ssize_t min_width;
+    BOOL locked;
     RE_CompileArgs subargs;
     int status;
 
@@ -25934,6 +25947,7 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
     args->end = join_node;
 
     min_width = PY_SSIZE_T_MAX;
+    locked = args->locked_min_width;
 
     subargs = *args;
 
@@ -25946,6 +25960,8 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
         /* Skip over the 'BRANCH' or 'NEXT' opcode. */
         ++subargs.code;
 
+        subargs.locked_min_width = locked;
+
         /* Compile the sequence until the next 'BRANCH' or 'NEXT' opcode. */
         status = build_sequence(&subargs);
         if (status != RE_ERROR_SUCCESS)
@@ -25957,6 +25973,7 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
         args->is_fuzzy |= subargs.is_fuzzy;
         args->has_groups |= subargs.has_groups;
         args->has_repeats |= subargs.has_repeats;
+        args->locked_min_width |= subargs.locked_min_width;
 
         /* Append the sequence. */
         add_node(branch_node, subargs.start);
@@ -25979,7 +25996,8 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
     args->visible_capture_count = subargs.visible_capture_count;
 
     ++args->code;
-    args->min_width += min_width;
+    if (!locked)
+        args->min_width += min_width;
     args->all_atomic = FALSE;
 
     return RE_ERROR_SUCCESS;
@@ -26021,12 +26039,14 @@ Py_LOCAL_INLINE(int) build_CALL_REF(RE_CompileArgs* args) {
         return RE_ERROR_ILLEGAL;
 
     args->code = subargs.code;
-    args->min_width += subargs.min_width;
+    if (!args->locked_min_width)
+        args->min_width += subargs.min_width;
     args->has_captures |= subargs.has_captures;
     args->is_fuzzy |= subargs.is_fuzzy;
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     ++args->code;
 
@@ -26076,7 +26096,7 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
     add_node(args->end, node);
     args->end = node;
 
-    if (step != 0)
+    if (step != 0 && !args->locked_min_width)
         ++args->min_width;
 
     return RE_ERROR_SUCCESS;
@@ -26084,18 +26104,37 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
 
 /* Builds an EXEC_CODE node. */
 Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
+    RE_UINT8 op;
     RE_Node* node;
 
     /* codes: opcode, code_id, halt_timer. */
     if (args->code + 2 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
+    switch (args->code[0]) {
+    case RE_OP_EXEC_CODE_OPT:
+        args->locked_min_width = TRUE;
+        op = RE_OP_EXEC_CODE;
+        break;
+    case RE_OP_EXEC_CODE_ADV_OPT:
+        args->locked_min_width = TRUE;
+        op = RE_OP_EXEC_CODE_ADV;
+        break;
+    case RE_OP_EXEC_CODE_REV_OPT:
+        args->locked_min_width = TRUE;
+        op = RE_OP_EXEC_CODE_REV;
+        break;
+    default:
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
     int flags = 0;
     if (args->forward)
         flags |= RE_STATUS_REVERSE;
 
     /* Create the node. */
-    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 2);
+    node = create_node(args->pattern, op, flags, 0, 2);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26118,10 +26157,14 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
     RE_CompileArgs subargs;
     int status;
     Py_ssize_t min_width;
+    BOOL locked;
 
     /* codes: opcode, code_id, halt_timer, ..., next, ..., end. */
     if (args->code + 3 > args->end_code)
         return RE_ERROR_ILLEGAL;
+
+    if (args->code[0] == RE_OP_EXEC_CODE_CONDITIONAL_OPT)
+        args->locked_min_width = TRUE;
 
     int flags = 0;
     if (args->forward)
@@ -26138,6 +26181,8 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
 
     args->code += 3;
 
+    locked = args->locked_min_width;
+
     subargs = *args;
     status = build_sequence(&subargs);
     if (status != RE_ERROR_SUCCESS)
@@ -26149,6 +26194,7 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     min_width = subargs.min_width;
 
@@ -26164,6 +26210,7 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
         true_branch_end = subargs.end;
 
         subargs.code = args->code;
+        subargs.locked_min_width = locked;
 
         status = build_sequence(&subargs);
         if (status != RE_ERROR_SUCCESS)
@@ -26175,6 +26222,7 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
         args->has_groups |= subargs.has_groups;
         args->has_repeats |= subargs.has_repeats;
         args->visible_capture_count = subargs.visible_capture_count;
+        args->locked_min_width |= subargs.locked_min_width;
 
         min_width = min_ssize_t(min_width, subargs.min_width);
 
@@ -26189,7 +26237,8 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
         min_width = 0;
     }
 
-    args->min_width += min_width;
+    if (!locked)
+        args->min_width += min_width;
 
     if (args->code[0] != RE_OP_END)
         return RE_ERROR_ILLEGAL;
@@ -26212,6 +26261,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     RE_Node* end_test_node;
     RE_Node* end_node;
     Py_ssize_t min_width;
+    BOOL locked;
 
     /* codes: opcode, flags, forward, ..., next, ..., next, ..., end. */
     if (args->code + 4 > args->end_code)
@@ -26247,6 +26297,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     ++args->code;
 
@@ -26266,6 +26317,8 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     add_node(test_node, subargs.start);
     add_node(subargs.end, end_test_node);
 
+    locked = args->locked_min_width;
+
     /* Compile the true branch. */
     subargs = *args;
     status = build_sequence(&subargs);
@@ -26279,6 +26332,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     min_width = subargs.min_width;
 
@@ -26298,6 +26352,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
 
         /* Compile the false branch. */
         subargs.code = args->code;
+        subargs.locked_min_width = locked;
         status = build_sequence(&subargs);
         if (status != RE_ERROR_SUCCESS)
             return status;
@@ -26309,6 +26364,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
         args->has_groups |= subargs.has_groups;
         args->has_repeats |= subargs.has_repeats;
         args->visible_capture_count = subargs.visible_capture_count;
+        args->locked_min_width |= subargs.locked_min_width;
 
         min_width = min_ssize_t(min_width, subargs.min_width);
 
@@ -26325,7 +26381,8 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     if (args->code[0] != RE_OP_END)
         return RE_ERROR_ILLEGAL;
 
-    args->min_width += min_width;
+    if (!locked)
+        args->min_width += min_width;
 
     ++args->code;
 
@@ -26388,12 +26445,14 @@ Py_LOCAL_INLINE(int) build_GROUP(RE_CompileArgs* args) {
         return RE_ERROR_ILLEGAL;
 
     args->code = subargs.code;
-    args->min_width += subargs.min_width;
+    if (!args->locked_min_width)
+        args->min_width += subargs.min_width;
     args->has_captures |= subargs.has_captures | subargs.visible_captures;
     args->is_fuzzy |= subargs.is_fuzzy;
     args->has_groups |= TRUE;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     if (!args->in_define)
         ++args->visible_capture_count;
@@ -26455,6 +26514,7 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
     RE_CompileArgs subargs;
     int status;
     Py_ssize_t min_width;
+    BOOL locked;
 
     /* codes: opcode, ..., next, ..., end. */
     if (args->code + 2 > args->end_code)
@@ -26478,6 +26538,8 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
 
     start_node->values[0] = group;
 
+    locked = args->locked_min_width;
+
     subargs = *args;
     subargs.in_define = TRUE;
     status = build_sequence(&subargs);
@@ -26490,6 +26552,7 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     min_width = subargs.min_width;
 
@@ -26505,6 +26568,7 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
         true_branch_end = subargs.end;
 
         subargs.code = args->code;
+        subargs.locked_min_width = locked;
 
         status = build_sequence(&subargs);
         if (status != RE_ERROR_SUCCESS)
@@ -26513,7 +26577,6 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
         args->code = subargs.code;
         args->has_captures |= subargs.has_captures;
         args->is_fuzzy |= subargs.is_fuzzy;
-        args->visible_capture_count = subargs.visible_capture_count;
 
         if (group == 0) {
             /* Join the 2 branches end-to-end and bypass it. The sequence
@@ -26527,6 +26590,7 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
             args->has_groups |= subargs.has_groups;
             args->has_repeats |= subargs.has_repeats;
             args->visible_capture_count = subargs.visible_capture_count;
+            args->locked_min_width |= subargs.locked_min_width;
 
             min_width = min_ssize_t(min_width, subargs.min_width);
 
@@ -26542,7 +26606,8 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
         min_width = 0;
     }
 
-    args->min_width += min_width;
+    if (!locked)
+        args->min_width += min_width;
 
     if (args->code[0] != RE_OP_END)
         return RE_ERROR_ILLEGAL;
@@ -26601,6 +26666,7 @@ Py_LOCAL_INLINE(int) build_LOOKAROUND(RE_CompileArgs* args) {
     args->has_groups |= subargs.has_groups;
     args->has_repeats |= subargs.has_repeats;
     args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
 
     if (subargs.has_groups)
         lookaround_node->status |= RE_STATUS_HAS_GROUPS;
@@ -26664,7 +26730,7 @@ Py_LOCAL_INLINE(int) build_RANGE(RE_CompileArgs* args) {
     add_node(args->end, node);
     args->end = node;
 
-    if (step != 0)
+    if (step != 0 && !args->locked_min_width)
         ++args->min_width;
 
     return RE_ERROR_SUCCESS;
@@ -26733,12 +26799,14 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
             return RE_ERROR_ILLEGAL;
 
         args->code = subargs.code;
-        args->min_width += subargs.min_width;
+        if (!args->locked_min_width)
+            args->min_width += subargs.min_width;
         args->has_captures |= subargs.has_captures;
         args->is_fuzzy |= subargs.is_fuzzy;
         args->has_groups |= subargs.has_groups;
         args->has_repeats |= subargs.has_repeats;
         args->visible_capture_count = subargs.visible_capture_count;
+        args->locked_min_width |= subargs.locked_min_width;
 
         ++args->code;
 
@@ -26773,11 +26841,13 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
                 args->end = subargs.end;
             }
 
-            args->min_width += (Py_ssize_t)min_count * subargs.min_width;
+            if (!args->locked_min_width)
+                args->min_width += (Py_ssize_t)min_count * subargs.min_width;
             args->has_captures |= subargs.has_captures;
             args->is_fuzzy |= subargs.is_fuzzy;
             args->has_groups |= subargs.has_groups;
             args->has_repeats |= subargs.has_repeats;
+            args->locked_min_width |= subargs.locked_min_width;
 
             min_count -= done_count;
             if (~max_count != 0)
@@ -26822,12 +26892,14 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
                 return RE_ERROR_ILLEGAL;
 
             args->code = subargs.code;
-            args->min_width += (Py_ssize_t)min_count * subargs.min_width;
+            if (!args->locked_min_width)
+                args->min_width += (Py_ssize_t)min_count * subargs.min_width;
             args->has_captures |= subargs.has_captures;
             args->is_fuzzy |= subargs.is_fuzzy;
             args->has_groups |= subargs.has_groups;
             args->has_repeats = TRUE;
             args->visible_capture_count = subargs.visible_capture_count;
+            args->locked_min_width |= subargs.locked_min_width;
 
             ++args->code;
 
@@ -26926,13 +26998,14 @@ Py_LOCAL_INLINE(int) build_STRING(RE_CompileArgs* args, BOOL is_charset) {
     add_node(args->end, node);
     args->end = node;
 
-    /* Because of full case-folding, one character in the text could match
-     * multiple characters in the pattern.
-     */
-    if (op == RE_OP_STRING_FLD || op == RE_OP_STRING_FLD_REV)
-        args->min_width += possible_unfolded_length((Py_ssize_t)length);
-    else
-        args->min_width += (Py_ssize_t)length;
+    if (!args->locked_min_width)
+        /* Because of full case-folding, one character in the text could match
+         * multiple characters in the pattern.
+         */
+        if (op == RE_OP_STRING_FLD || op == RE_OP_STRING_FLD_REV)
+            args->min_width += possible_unfolded_length((Py_ssize_t)length);
+        else
+            args->min_width += (Py_ssize_t)length;
 
     return RE_ERROR_SUCCESS;
 }
@@ -26944,6 +27017,7 @@ Py_LOCAL_INLINE(int) build_SET(RE_CompileArgs* args) {
     Py_ssize_t step;
     RE_Node* node;
     Py_ssize_t min_width;
+    BOOL locked;
     int status;
 
     /* codes: opcode, flags, ..., end. */
@@ -26966,6 +27040,7 @@ Py_LOCAL_INLINE(int) build_SET(RE_CompileArgs* args) {
     args->end = node;
 
     min_width = args->min_width;
+    locked = args->locked_min_width;
 
     /* Compile the character set. */
     do {
@@ -27018,7 +27093,7 @@ Py_LOCAL_INLINE(int) build_SET(RE_CompileArgs* args) {
 
     args->min_width = min_width;
 
-    if (step != 0)
+    if (step != 0 && !locked)
         ++args->min_width;
 
     return RE_ERROR_SUCCESS;
@@ -27218,14 +27293,18 @@ Py_LOCAL_INLINE(int) build_sequence(RE_CompileArgs* args) {
                 return status;
             break;
         case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_OPT:
         case RE_OP_EXEC_CODE_ADV:
+        case RE_OP_EXEC_CODE_ADV_OPT:
         case RE_OP_EXEC_CODE_REV:
+        case RE_OP_EXEC_CODE_REV_OPT:
             /* Embedded python code. */
             status = build_EXEC_CODE(args);
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
         case RE_OP_EXEC_CODE_CONDITIONAL:
+        case RE_OP_EXEC_CODE_CONDITIONAL_OPT:
             /* Embedded python code conditional. */
             status = build_EXEC_CODE_CONDITIONAL(args);
             if (status != RE_ERROR_SUCCESS)
@@ -27388,6 +27467,7 @@ Py_LOCAL_INLINE(BOOL) compile_to_nodes(RE_CODE* code, RE_CODE* end_code,
     args.within_fuzzy = FALSE;
     args.visible_capture_count = 0;
     args.in_define = FALSE;
+    args.locked_min_width = FALSE;
     status = build_sequence(&args);
     if (status == RE_ERROR_ILLEGAL)
         set_error(RE_ERROR_ILLEGAL, NULL);
@@ -27543,6 +27623,8 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     PyObject* embedded_code;
     PyObject* globals;
     PyObject* locals;
+    PyObject* modified_pattern;
+    PyObject* codeindex;
     size_t code_count;
     PyObject** compiled_code;
     BOOL unpacked;
@@ -27558,10 +27640,10 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     BOOL ascii;
     BOOL ok;
 
-    if (!PyArg_ParseTuple(args, "OnOOOOOnOnnOOO:re_compile", &pattern, &flags,
+    if (!PyArg_ParseTuple(args, "OnOOOOOnOnnOOOOO:re_compile", &pattern, &flags,
       &code_list, &groupindex, &indexgroup, &named_lists, &named_list_indexes,
       &req_offset, &required_chars, &req_flags, &public_group_count,
-      &embedded_code, &globals, &locals))
+      &embedded_code, &globals, &locals, &modified_pattern, &codeindex))
         return NULL;
 
     /* If it came from a pickled source, code_list will be a packed code list
@@ -27667,6 +27749,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
 
     /* Initialise the PatternObject. */
     self->pattern = pattern;
+    self->modified_pattern = modified_pattern;
     self->module = self_;
     self->flags = flags;
     self->packed_code_list = packed_code_list;
@@ -27684,6 +27767,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->locals = locals;
     self->code_count = code_count;
     self->compiled_code = compiled_code;
+    self->codeindex = codeindex;
     self->named_lists = named_lists;
     self->named_lists_count = (size_t)PyDict_Size(named_lists);
     self->partial_named_lists[0] = NULL;
@@ -27710,6 +27794,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->req_string = NULL;
     self->locale_info = NULL;
     Py_INCREF(self->pattern);
+    Py_INCREF(self->modified_pattern);
     Py_INCREF(self->module);
     if (unpacked) {
         Py_INCREF(self->packed_code_list);
@@ -27719,6 +27804,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     Py_INCREF(self->globals);
     Py_INCREF(self->locals);
     Py_INCREF(self->code);
+    Py_INCREF(self->codeindex);
     Py_INCREF(self->named_lists);
     Py_INCREF(self->named_list_indexes);
     Py_INCREF(self->required_chars);

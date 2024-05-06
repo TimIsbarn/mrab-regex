@@ -33,7 +33,7 @@ Flags
 
 There are 2 kinds of flag: scoped and global. Scoped flags can apply to only part of a pattern and can be turned on or off; global flags apply to the entire pattern and can only be turned on.
 
-The scoped flags are: ``ASCII (?a)``, ``FULLCASE (?f)``, ``IGNORECASE (?i)``, ``LOCALE (?L)``, ``MULTILINE (?m)``, ``DOTALL (?s)``, ``UNICODE (?u)``, ``VERBOSE (?x)``, ``WORD (?w)``.
+The scoped flags are: ``ASCII (?a)``, ``CODE (?c)``, ``FULLCASE (?f)``, ``HALT_TIMER (?h)``, ``IGNORECASE (?i)``, ``LOCALE (?L)``, ``MULTILINE (?m)``, ``NO_CODE (?n)``, ``DOTALL (?s)``, ``UNICODE (?u)``, ``VERBOSE (?x)``, ``WORD (?w)``.
 
 The global flags are: ``BESTMATCH (?b)``, ``ENHANCEMATCH (?e)``, ``POSIX (?p)``, ``REVERSE (?r)``, ``VERSION0 (?V0)``, ``VERSION1 (?V1)``.
 
@@ -42,6 +42,12 @@ If neither the ``ASCII``, ``LOCALE`` nor ``UNICODE`` flag is specified, it will 
 The ``ENHANCEMATCH`` flag makes fuzzy matching attempt to improve the fit of the next match that it finds.
 
 The ``BESTMATCH`` flag makes fuzzy matching search for the best match instead of the next match.
+
+The ``CODE`` flag allows evaluation of embedded code during parsing. It also acts as a global flag for execution of code during matching.
+
+The ``NO_CODE`` flag ignores all embedded code after parsing, this does not prevent evaluating code during parsing.
+
+The ``HALT_TIMER`` flag ignores the time spent executing embedded code for measuring the timeout.
 
 Old vs new behaviour
 --------------------
@@ -66,8 +72,6 @@ In order to be compatible with the re module, this module has 2 behaviours:
 
   * Case-insensitive matches in Unicode use simple case-folding by default.
 
-  * No relative group references.
-
 * **Version 1** behaviour (new behaviour, possibly different from the re module):
 
   * Indicated by the ``VERSION1`` flag.
@@ -79,8 +83,6 @@ In order to be compatible with the re module, this module has 2 behaviours:
   * Nested sets and set operations are supported.
 
   * Case-insensitive matches in Unicode use full case-folding by default.
-
-  * Relative group references.
 
 If no version is specified, the regex module will default to ``regex.DEFAULT_VERSION``.
 
@@ -1052,3 +1054,120 @@ The matching methods and functions support timeouts. The timeout (in seconds) ap
     File "C:\Python310\lib\site-packages\regex\regex.py", line 278, in sub
       return pat.sub(repl, string, count, pos, endpos, concurrent, timeout)
   TimeoutError: regex timed out
+
+Embedded code
+^^^^^^^^^^^^^
+
+``(?{code})`` or ``(?{name}{code})``
+
+Embedded code is executed whenever the engine encounters it. A reference to the ``StateObject`` can be gained via the module function ``state``.
+Using a ``StateObject`` outside the code block where it was created causes a ``TypeError``.
+The StateObject methods ``fail`` and ``advance`` cause the engine to advance or backtrack.
+Named code blocks can be referenced via that name.
+Globals and locals can be specified via the corresponding attributes in the methods for compiling and matching.
+
+* ``(?+{code})`` or ``(?+{name}{code})`` execute only on advancing.
+
+* ``(?-{code})`` or ``(?-{name}{code})`` execute only on backtracking.
+
+.. sourcecode:: python
+
+  >>> pattern = regex.compile("(?c)(?P<foo>.)(?{if regex.state().group('foo') == 'a':\n\tregex.state().fail()})", globals=globals())
+  >>> pattern.match("a")
+  >>> pattern.match("b")
+  <regex.Match object; span=(0, 1), match='b'>
+
+Optimistic code
+^^^^^^^^^^^^^^^
+
+``(*{code})`` or ``(*{name}{code})``
+
+Embedded code disables certain optimizations to ensure running the code when execution would be expected.
+Optimistic code doesn't disable these optimizations, code may run less often than expected or not at all, especially on failure.
+
+* ``(*+{code})`` or ``(*+{name}{code})`` execute only on advancing.
+
+* ``(*-{code})`` or ``(*-{name}{code})`` execute only on backtracking.
+
+.. sourcecode:: python
+
+  >> regex.match("(?c)(*+{print('0')})a(?{print('1')})", "b")
+  0
+  >> regex.match("(?c)(*+{print('0')})a(?{print('1')})", "a")
+  0
+  1
+  <regex.Match object; span=(0, 1), match='a'>
+
+The optimized code however doesn't run at all.
+
+.. sourcecode:: python
+
+  >> regex.match("(?c)(?+{print('0')})a(?{print('1')})", "b")
+  >> regex.match("(?c)(?+{print('0')})a(?{print('1')})", "a")
+  0
+  1
+  <regex.Match object; span=(0, 1), match='a'>
+
+Code references
+^^^^^^^^^^^^^^^
+
+``(?C=name)``, ``(?C+name)`` or ``(?C-name)``
+
+Throws an exception if no code of the given name exists, otherwise behaves like embedded code using the referenced code.
+
+.. sourcecode:: python
+
+  >>> pattern = regex.compile("(?c)(?C=foo)(a)(?{foo}{print(regex.state().group(1))})", globals=globals())
+  >>> pattern.match("a")
+  None
+  a
+  <regex.Match object; span=(0, 1), match='a'>
+  >>> pattern.match("b")
+  None
+
+Optimistic code references
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``(*C=name)``, ``(*C+name)`` or ``(*C-name)``
+
+Behave like code references without disabling certain optimizations.
+
+Code conditionals
+^^^^^^^^^^^^^^^^^
+
+``(?(?{code})yes|no)``, ``(?(?{name}{code})yes|no)`` or ``(?(?C=name)yes|no)``
+
+The code is executed once to determine which branch to match next. If the ``fail`` method is called, the no_branch matches next, otherwise the yes_branch.
+
+Optimistic code conditionals
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``(?(*{code})yes|no)``, ``(?(*{name}{code})yes|no)`` or ``(?(*C=name)yes|no)``
+
+Behave like code conditionals without disabling certain optimizations.
+
+Evaluated code
+^^^^^^^^^^^^^^
+
+``(??{code})`` or ``(??{name}{code})``
+
+Evaluates the code only when the ``CODE`` flag is set. The result has to be a string, which is then inserted into the pattern and parsed.
+The ``CODE`` flag cannot be turned on and the ``NO_CODE`` flag cannot be turned off within the result of evaluated code.
+If the ``NO_CODE`` flag is set, the code block will not be included in the ``PatternObject``, but still evaluated.
+The unmodified pattern is accessible via the attribute ``PatternObject.original_pattern``.
+
+.. sourcecode:: python
+
+  >>> pat = regex.compile("(?c)(??{f('a')})", locals={"f": lambda s: s * 3})
+  >>> pat.pattern
+  '(?c)aaa'
+  >>> pat.original_pattern
+  "(?c)(??{f('a')})"
+
+Evaluated Code references
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``(??C=name)``
+
+Throws an exception if no code of the given name exists, otherwise behaves like evaluated code.
+Evaluated code blocks are evaluated left to right, references can refer to code that is declared later.
