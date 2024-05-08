@@ -23,9 +23,9 @@ import regex._regex as _regex
 
 __all__ = ["A", "ASCII", "B", "BESTMATCH", "C", "CODE", "D", "DEBUG", "E",
   "ENHANCEMATCH", "F", "FULLCASE", "H", "HALT_TIMER", "I", "IGNORECASE", "L",
-  "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P", "POSIX", "R", "REVERSE", "S",
-  "DOTALL", "T", "TEMPLATE", "U", "UNICODE", "V0", "VERSION0", "V1", "VERSION1",
-  "W", "WORD", "X", "VERBOSE", "error", "Scanner", "RegexFlag"]
+  "LOCALE", "M", "MULTILINE", "N", "NO_CODE", "P", "POSIX", "R", "REVERSE",
+  "S", "DOTALL", "T", "TEMPLATE", "U", "UNICODE", "V0", "VERSION0", "V1",
+  "VERSION1", "W", "WORD", "X", "VERBOSE", "error", "Scanner", "RegexFlag"]
 
 # The regex exception.
 class error(Exception):
@@ -56,11 +56,10 @@ class error(Exception):
                 message += " (line {}, column {})".format(self.lineno,
                   self.colno)
 
+            # Proper error messages for inserted patterns.
             if depth and len(depth):
-                t = []
-                for pos, d in reversed(depth):
-                    t.append("\n\tin evaluated code {} at position {}".format(d,
-                      pos))
+                t = [f"\n\tin evaluated code {d} at position {pos}"
+                     for pos, d in reversed(depth)]
                 message += "".join(t)
 
         Exception.__init__(self, message)
@@ -95,8 +94,8 @@ class RegexFlag(enum.IntFlag):
     I = IGNORECASE = 0x2      # Ignore case.
     L = LOCALE = 0x4          # Assume current 8-bit locale.
     M = MULTILINE = 0x8       # Make anchors look for newline.
-    N = NO_CODE = 0x80000     # Ignore all code.
     P = POSIX = 0x10000       # POSIX-style matching (leftmost longest).
+    N = NO_CODE = 0x80000     # Ignore parsed executed code.
     R = REVERSE = 0x400       # Search backwards.
     S = DOTALL = 0x10         # Make dot match newline.
     U = UNICODE = 0x20        # Assume Unicode locale.
@@ -1287,9 +1286,9 @@ def parse_code(source, info, advance=True, backtrack=True,
     if info.flags & NO_CODE:
         return Sequence()
 
-    code_id = info.code(code, name)
+    code_id = info.code_id(code, name)
 
-    if code_id < 0 or (not advance and not backtrack):
+    if not advance and not backtrack:
         return Sequence()
 
     return Code(code_id, bool(info.flags & HALT_TIMER), advance,
@@ -1301,30 +1300,18 @@ def parse_code_eval(source, info, pos):
     code = parse_code_text(source)
     source.expect("})")
 
-    no_code = info.flags & NO_CODE
-
     id = info.absolute_id
     info.absolute_id += 1
-
-    if not no_code:
-        code_id = info.code(code, name)
-
-        if code_id < 0:
-            return Sequence()
 
     if not (info.flags & CODE):
         return Sequence()
 
+    code_id = info.eval_code_id(code, name)
+
     info.evaluated_code = True
 
-    if no_code or not name:
-        # Code isn't stored in info.
-        return CodeEval(info.flags, code, id, pos, source.pos,
-          source.depth.copy())
-
-    # For better dump message, reference the stored code instead.
-    return CodeRefEval(info.flags, name, id, pos, source.pos,
-      source.depth.copy())
+    return CodeEval(info.flags, info.lock_code, info.lock_no_code, code_id, id,
+      pos, source.pos, source.depth.copy())
 
 def parse_code_ref(source, info, advance=True, backtrack=True,
   optimistic=False):
@@ -1338,16 +1325,15 @@ def parse_code_ref(source, info, advance=True, backtrack=True,
     if info.flags & NO_CODE:
         return Sequence()
 
-    code_id = info.get_code_id(name)
+    code_id = info.code_index.get(name)
     if code_id is not None:
-        if code_id < 0:
-            return Sequence()
+        # Code of given name already exists, no need to wait.
         return Code(code_id, bool(info.flags & HALT_TIMER), advance,
           backtrack, optimistic)
 
     info.evaluated_code = True
 
-    return CodeRef(name, bool(info.flags & HALT_TIMER), advance,
+    return CodeRef(info, name, bool(info.flags & HALT_TIMER), advance,
       backtrack, optimistic, saved_pos, source.depth.copy())
 
 def parse_code_ref_eval(source, info, pos):
@@ -1358,14 +1344,14 @@ def parse_code_ref_eval(source, info, pos):
     id = info.absolute_id
     info.absolute_id += 1
 
-    if info.flags & NO_CODE or not (info.flags & CODE):
+    if not (info.flags & CODE):
         return Sequence()
 
     info.evaluated_code = True
 
     # Ensure evaluation of code from left to right.
-    return CodeRefEval(info.flags, name, id, pos, source.pos,
-      source.depth.copy())
+    return CodeRefEval(info.flags, info.lock_code, info.lock_no_code, name, id,
+      pos, source.pos, source.depth.copy())
 
 def parse_code_conditional(source, info, optimistic=False):
     "Parses a code conditional."
@@ -1408,7 +1394,7 @@ def parse_code_conditional(source, info, optimistic=False):
         parse_items()
         return no_conditional()
 
-    code_id = info.code(code, name)
+    code_id = info.code_id(code, name)
 
     parse_items()
 
@@ -1457,7 +1443,7 @@ def parse_code_conditional_ref(source, info, optimistic=False):
     if info.flags & NO_CODE:
         return no_conditional()
 
-    code_id = info.get_code_id(name)
+    code_id = info.code_index.get(name)
     if code_id is not None:
         if code_id < 0:
             return no_conditional()
@@ -1469,26 +1455,28 @@ def parse_code_conditional_ref(source, info, optimistic=False):
         return CodeConditional(code_id, bool(info.flags & HALT_TIMER),
           yes_item, no_item, optimistic)
 
-    return CodeRefConditional(name, bool(info.flags & HALT_TIMER),
+    return CodeRefConditional(info, name, bool(info.flags & HALT_TIMER),
       yes_item, no_item, optimistic, saved_pos, source.depth.copy())
 
 def evaluate_code(source, info, code):
     "Evaluates python code."
     result = eval(code, info.globals, info.locals)
+    t = type(result)
+    if t not in (str, bytes):
+        raise error("evaluated code should return a string or bytes",
+          source.string, source.pos, source.depth)
+
     if not result:
         return "", True
 
-    t = type(result)
     if t is str:
         return result, False
     elif t is bytes:
         return result.decode("latin-1"), True
 
-    raise error("evaluated code should return a string, bytes or None",
-      source.string, source.pos, source.depth)
-
-def insert_code(source, info, flags, code, code_id, start_pos, end_pos, depth):
-    "Evaluates python code and inserts it into the regex string."
+def insert_code(source, info, flags, lock_code, lock_no_code, code, code_id,
+  start_pos, end_pos, depth):
+    "Evaluates python code and inserts it into the pattern."
     if start_pos < 0:
         raise error(f"start pos cannot be negative: {start_pos}",
           source.string, source.pos, depth)
@@ -1514,7 +1502,11 @@ def insert_code(source, info, flags, code, code_id, start_pos, end_pos, depth):
     source.sep = source.string[:0]
 
     saved_flags = info.flags
+    saved_lock_code = info.lock_code
+    saved_lock_no_code = info.lock_no_code
     info.flags = flags
+    info.lock_code = lock_code
+    info.lock_no_code = lock_no_code
     pattern_depth = depth.copy()
     pattern_depth.append((start_pos, code_id))
     source.depth = pattern_depth
@@ -1524,6 +1516,8 @@ def insert_code(source, info, flags, code, code_id, start_pos, end_pos, depth):
         result = _parse_pattern(source, info)
     finally:
         info.flags = saved_flags
+        info.lock_code = saved_lock_code
+        info.lock_no_code = saved_lock_no_code
         info.absolute_id = old_id
         source.ignore_space = bool(info.flags & VERBOSE)
         source.depth = depth
@@ -1538,9 +1532,8 @@ def insert_code(source, info, flags, code, code_id, start_pos, end_pos, depth):
     info.insertion_offset = old_offset
 
     # Insert the new string into the pattern.
-    mod = old_modified
-    rep = source.string
-    source.modified = mod[:start_pos] + rep + mod[end_pos:]
+    source.modified = (old_modified[:start_pos] + source.string +
+      old_modified[end_pos:])
     # Preserve the original string at the top level.
     source.string = source.modified if depth else old_string
 
@@ -1585,15 +1578,26 @@ def parse_flags(source, info):
 
 def parse_subpattern(source, info, flags_on, flags_off):
     "Parses a subpattern with scoped flags."
+    locked_code = False
+    locked_no_code = False
+    if not info.lock_code and ((flags_on & CODE) or (flags_off & CODE)):
+        info.lock_code = locked_code = True
+    if not info.lock_no_code and ((flags_on & NO_CODE) or (flags_off & NO_CODE)):
+        info.lock_no_code = locked_no_code = True
     saved_flags = info.flags
     info.flags = (info.flags | flags_on) & ~flags_off
     source.ignore_space = bool(info.flags & VERBOSE)
+
     try:
         subpattern = _parse_pattern(source, info)
         source.expect(")")
     finally:
         info.flags = saved_flags
         source.ignore_space = bool(info.flags & VERBOSE)
+        if locked_code:
+            info.lock_code = False
+        if locked_no_code:
+            info.lock_no_code = False
 
     return subpattern
 
@@ -1612,15 +1616,14 @@ def parse_flags_subpattern(source, info):
         raise error("bad inline flags: flag turned on and off", source.string,
           source.pos, source.depth)
 
-    if source.depth:
-        # (??{f"(?-c){...}"}), (??{f"(?n){...}"}) or both to safely insert
-        # arbitrary code without evaluating it.
-        if flags_on & CODE:
-            raise error("cannot turn CODE flag on within evaluated code",
-              source.string, source.pos, source.depth)
-        if flags_off & NO_CODE: 
-            raise error("cannot turn NO_CODE flag off within evaluated code",
-              source.string, source.pos, source.depth)
+    if (flags_on & CODE) and info.lock_code:
+        # (??{f"(?-c:{...}"}) to safely insert arbitrary code as a pattern
+        # without evaluating nested code.
+        raise error("cannot turn CODE flag on within evaluated code",
+          source.string, source.pos, source.depth)
+    if (flags_off & NO_CODE) and info.lock_no_code: 
+        raise error("cannot turn NO_CODE flag off within evaluated code",
+          source.string, source.pos, source.depth)
 
     # Handle flags which are global in all regex behaviours.
     new_global_flags = (flags_on & ~info.global_flags) & GLOBAL_FLAGS
@@ -3102,7 +3105,7 @@ class Code(RegexBase):
         op = self._opcode.get((self.advance, self.backtrack, self.optimistic))
         if op is None:
             return []
-        
+
         return [(op, self.code_id, int(self.halt_timer))]
 
     def dump(self, indent, reverse):
@@ -3125,10 +3128,11 @@ class Code(RegexBase):
         raise _RequiredStringError()
 
 class CodeRef(RegexBase):
-    def __init__(self, name, halt_timer, advance, backtrack, optimistic,
+    def __init__(self, info, name, halt_timer, advance, backtrack, optimistic,
       position, depth):
         RegexBase.__init__(self)
-        self.name = name
+        self.info = info
+        self.code_id = name
         self.halt_timer = halt_timer
         self.advance = advance
         self.backtrack = backtrack
@@ -3136,16 +3140,17 @@ class CodeRef(RegexBase):
         self.position = position
         self.depth = depth
 
-        self._key = (self.__class__, self.name, self.halt_timer,
+        self._key = (self.__class__, self.code_id, self.halt_timer,
           self.advance, self.backtrack, self.optimistic)
 
-    def evaluate_code(self, source, info):
-        code_id = info.get_code_id(self.name)
-        if code_id is None:
-            raise error(f"unknown code reference: {name}", source.string,
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.code_id = self.info.code_index.get(self.code_id)
+        if self.code_id is None:
+            raise error(f"unknown code reference: {name}", pattern,
               self.position, self.depth)
 
-        return Code(code_id, self.halt_timer, self.advance, self.backtrack,
+    def optimise(self, info, reverse):
+        return Code(self.code_id, self.halt_timer, self.advance, self.backtrack,
           self.optimistic)
 
     def dump(self, indent, reverse):
@@ -3159,53 +3164,69 @@ class CodeRef(RegexBase):
           self.name, halt, adv, opt))
 
 class CodeEval(RegexBase):
-    def __init__(self, flags, code, code_id, start_pos, end_pos, depth):
+    def __init__(self, flags, lock_code, lock_no_code, code_id, abs_code_id,
+      start_pos, end_pos, depth):
         RegexBase.__init__(self)
         self.flags = flags
-        self.code = code
+        self.lock_code = lock_code
+        self.lock_no_code = lock_no_code
         self.code_id = code_id
+        self.abs_code_id = abs_code_id
         self.start_pos = start_pos
         self.end_pos = end_pos
         self.depth = depth
 
-        self._key = (self.__class__, self.flags, self.code, self.start_pos,
-          self.end_pos)
+        self._key = (self.__class__, self.flags, self.lock_code,
+          self.lock_no_code, self.code_id, self.start_pos, self.end_pos)
 
     def evaluate_code(self, source, info):
         self.start_pos += info.insertion_offset
         self.end_pos += info.insertion_offset
 
-        return insert_code(source, info, self.flags, self.code, self.code_id,
-          self.start_pos, self.end_pos, self.depth)
+        info.not_evaluated[self] = False
+
+        return insert_code(source, info, self.flags, self.lock_code,
+          self.lock_no_code, info.eval_code_text.get(self.code_id),
+          self.abs_code_id, self.start_pos, self.end_pos, self.depth)
 
     def dump(self, indent, reverse):
         print("{}CODE_REF_EVAL {}".format(INDENT * indent,
           self.code_id))
 
 class CodeRefEval(RegexBase):
-    def __init__(self, flags, name, code_id, start_pos, end_pos, depth):
+    def __init__(self, flags, lock_code, lock_no_code, name, code_id, start_pos,
+      end_pos, depth):
         RegexBase.__init__(self)
         self.flags = flags
+        self.lock_code = lock_code
+        self.lock_no_code = lock_no_code
         self.name = name
         self.code_id = code_id
         self.start_pos = start_pos
         self.end_pos = end_pos
         self.depth = depth
 
-        self._key = (self.__class__, self.flags, self.name, self.start_pos,
-          self.end_pos)
+        self._key = (self.__class__, self.flags, self.lock_code,
+          self.lock_no_code, self.name, self.start_pos, self.end_pos)
 
     def evaluate_code(self, source, info):
-        code_id = info.get_code_id(self.name)
-        if code_id is None:
+        if info.not_evaluated.get(self):
             raise error(f"unknown code reference: {self.name}",
               source.string, self.start_pos, self.depth)
+
+        code_id = info.eval_code_index.get(self.name)
+        if code_id is None:
+            info.not_evaluated[self] = True
+            return self
+
+        info.not_evaluated[self] = False
 
         self.start_pos += info.insertion_offset
         self.end_pos += info.insertion_offset
 
-        return insert_code(source, info, self.flags, info.code_text[code_id],
-          self.code_id, self.start_pos, self.end_pos, self.depth)
+        return insert_code(source, info, self.flags, self.lock_code,
+          self.lock_no_code, info.eval_code_text.get(code_id), self.code_id,
+          self.start_pos, self.end_pos, self.depth)
 
 class CodeConditional(RegexBase):
     def __init__(self, code_id, halt_timer, yes_item, no_item, optimistic):
@@ -3294,10 +3315,11 @@ class CodeConditional(RegexBase):
         raise _RequiredStringError()
 
 class CodeRefConditional(RegexBase):
-    def __init__(self, name, halt_timer, yes_item, no_item, optimistic,
+    def __init__(self, info, name, halt_timer, yes_item, no_item, optimistic,
       position, depth):
         RegexBase.__init__(self)
-        self.name = name
+        self.info = info
+        self.code_id = name
         self.halt_timer = halt_timer
         self.yes_item = yes_item
         self.no_item = no_item
@@ -3305,20 +3327,26 @@ class CodeRefConditional(RegexBase):
         self.position = position
         self.depth = depth
 
-        self._key = (self.__class__, self.name, self.halt_timer, self.yes_item,
+        self._key = (self.__class__, self.code_id, self.halt_timer, self.yes_item,
           self.no_item, self.optimistic)
 
     def evaluate_code(self, source, info):
-        code_id = info.get_code_id(self.name)
-        if code_id is None or code_id < 0:
-            raise error(f"unknown code reference: {name}", source.string,
+        self.yes_item = self.yes_item.evaluate_code(source, info)
+        self.no_item = self.no_item.evaluate_code(source, info)
+        return self
+
+    def fix_groups(self, pattern, reverse, fuzzy):
+        self.code_id = self.info.code_index.get(self.code_id)
+        if self.code_id is None:
+            raise error(f"unknown code reference: {name}", pattern,
               self.position, self.depth)
 
-        yes_item = self.yes_item.evaluate_code(source, info)
-        no_item = self.no_item.evaluate_code(source, info)
+        self.yes_item.fix_groups(pattern, reverse, fuzzy)
+        self.no_item.fix_groups(pattern, reverse, fuzzy)
 
-        return CodeConditional(code_id, self.halt_timer, yes_item,
-          no_item, self.optimistic)
+    def optimise(self, info, reverse):
+        return CodeConditional(self.code_id, self.halt_timer, self.yes_item,
+          self.no_item, self.optimistic)
 
     def dump(self, indent, reverse):
         halt = " HALT_TIMER" if self.halt_timer else ""
@@ -5044,6 +5072,8 @@ class Info:
         self.inline_locale = False
         self.evaluating = False
         self.evaluated_code = False
+        self.lock_code = False
+        self.lock_no_code = False
 
         self.kwargs = kwargs
         self.globals = globals
@@ -5061,10 +5091,18 @@ class Info:
         self.private_groups = {}
 
         self.code_count = 0
-        self.absolute_id = 0
         self.code_index = {}
+        self.code_name = {}
         self.code_text = {}
-        self.code_refs = {}
+        self.code_text_index = {}
+
+        self.eval_code_count = 0
+        self.eval_code_index = {}
+        self.eval_code_name = {}
+        self.eval_code_text = {}
+        self.eval_code_text_index = {}
+        self.not_evaluated = {}
+        self.absolute_id = 0
         self.insertion_offset = 0
 
     def open_group(self, name=None):
@@ -5118,28 +5156,33 @@ class Info:
             source.skip_while(WHITESPACE)
         return source.at_end()
 
-    def code(self, text, name):
-        index = self.code_index.get(text)
+    def code_id(self, text, name):
+        index = self.code_text_index.get(text)
         if index is None:
-            if self.empty_code(text):
-                index = -1
-                text = None
-            else:
-                index = self.code_count
-                self.code_count += 1
-            self.code_index[text] = index
+            index = self.code_count
+            self.code_count += 1
+            self.code_text_index[text] = index
             self.code_text[index] = text
 
-        if name and name not in self.code_refs:
-            self.code_refs[name] = index
+        if name and name not in self.code_text:
+            self.code_index[name] = index
+            self.code_name[index] = name
 
         return index
 
-    def get_code_id(self, name):
-        return self.code_refs.get(name)
+    def eval_code_id(self, text, name):
+        index = self.eval_code_text_index.get(text)
+        if index is None:
+            index = self.eval_code_count
+            self.eval_code_count += 1
+            self.eval_code_text_index[text] = index
+            self.eval_code_text[index] = text
 
-    def get_code(self, id):
-        return self.code_text.get(id)
+        if name and name not in self.eval_code_index:
+            self.eval_code_index[name] = index
+            self.eval_code_name[index] = name
+
+        return index
 
 def _check_group_features(info, parsed):
     """Checks whether the reverse and fuzzy features of the group calls match
@@ -5271,7 +5314,7 @@ class Scanner:
 
         # Embedded code
         embedded_code = tuple(c for c in info.code_text.values() if c)
-        code_index = info.code_refs.copy()
+        code_index = info.code_index.copy()
 
         # Whether to store the passed globals and locals in the pattern.
         if store:

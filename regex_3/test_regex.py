@@ -4487,7 +4487,7 @@ thing
         self.assertTrue(bool(pat.fullmatch("bar")))
         self.assertDictEqual(ls, {"func": func, "bar": 1, "baz": 4})
 
-        # Changing variables while matching and evaluating code while parsing.
+        # Changing variables while matching and evaluates code while parsing.
         idx = 1
         def func(s):
             nonlocal idx
@@ -4499,8 +4499,9 @@ thing
         self.assertEqual(pat.pattern, "(?c)a aa aaa")
         self.assertEqual(pat.original_pattern,
           "(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)")
-        self.assertTupleEqual(pat.code, ("f('a')",))
-        self.assertDictEqual(pat.codeindex, {"foo": 0})
+        # Evaluated code isn't stored in the pattern.
+        self.assertTupleEqual(pat.code, ())
+        self.assertDictEqual(pat.codeindex, {})
         self.assertEqual(idx, 4)
         self.assertTrue(bool(pat.match("a aa aaa")))
 
@@ -4593,12 +4594,12 @@ thing
           "(?c)foo = 2")
 
         # NO_CODE doesn't prevent evaluation.
-        pat = regex.compile("(?cn)(??{foo}{'abc'})")
+        pat = regex.compile("(?cn)(??{foo}{'abc'}) (??C=foo)")
         self.assertTupleEqual(pat.code, ())
         self.assertDictEqual(pat.codeindex, {})
-        self.assertEqual(pat.pattern, "(?cn)abc")
+        self.assertEqual(pat.pattern, "(?cn)abc abc")
 
-        # Cannot turn CODE flag on within evaluated code. 
+        # Cannot turn CODE flag on when scoped. 
         self.assertRaisesRegex(regex.error,
           "^cannot turn CODE flag on within evaluated code at position 8\n\tin evaluated code 0 at position 4$",
           lambda: regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
@@ -4609,10 +4610,10 @@ thing
         self.assertEqual(regex.compile("(?c)(??{f()})",
           locals={"f": lambda: "(??{\"foo\"})"}).pattern, "(?c)foo")
 
-        # Cannot turn NO_CODE flag off within evaluated code.
+        # Cannot turn NO_CODE flag off when scoped.
         self.assertRaisesRegex(regex.error,
-          "^cannot turn NO_CODE flag off within evaluated code at position 4\n\tin evaluated code 0 at position 5$",
-          lambda: regex.compile("(?cn)(??{f()})",
+          "^cannot turn NO_CODE flag off within evaluated code at position 4\n\tin evaluated code 0 at position 8$",
+          lambda: regex.compile("(?c)(?n:(??{f()}))",
           locals={"f": lambda: "(?-n:(??{\"foo\"}))"}))
         self.assertEqual(regex.compile("(?cn)(??{f()})",
           locals={"f": lambda: "(??{\"foo\"})"}).pattern,
@@ -4635,20 +4636,45 @@ thing
         self.assertFalse(bool(regex.match("(?c)(*C+foo)a(?{foo}{c += 1})",
           "b", locals=ls)))
         self.assertDictEqual(ls, {"c": 0})
-        ls["c"] = 0
+        ls = {}
+        # Runs once despite the input string being shorter than the minimum width.
         self.assertFalse(bool(regex.match("(?c)abc(?+{c = 1})def",
           "abc", locals=ls)))
-        self.assertDictEqual(ls, {"c": 0})
-        ls["c"] = 0
-        # Runs once despite the input string being shorter than the minimum width.
+        self.assertDictEqual(ls, {"c": 1})
+        ls = {}
         self.assertFalse(bool(regex.match("(?c)abc(*+{c = 1})def",
           "abc", locals=ls)))
-        self.assertDictEqual(ls, {"c": 1})
+        self.assertDictEqual(ls, {})
 
         # Correct nested error messages.
         self.assertRaisesRegex(regex.error,
           "^invalid group reference at position 3\n\tin evaluated code 0 at position 0\n\tin evaluated code 0 at position 4$",
           lambda: regex.compile("(?c)(??{'(??{\"(?(2)abc)\"})'})"))
+
+        # Recursive replacement of evaluated code.
+        self.assertEqual(regex.compile(
+          "(?c)(??C=foo) (??{'(??{foo}{\"bar\"})'})").pattern, "(?c)bar bar")
+
+        # Last change of CODE flag is used as global flag.
+        ls = {"l": 3}
+        pat = regex.compile("(?c)(?{l = 2})(?-c)", locals=ls)
+        pat.match("a")
+        self.assertDictEqual(ls, {"l": 3})
+
+        # 'drop_code' immediately removes all code and prevents further execution.
+        ls = {}
+        pat = regex.compile(
+            "(?{a=1})(?{pat.drop_code()})(?{b=2})")
+        pat.run_code = True
+        pat.globals = {"pat": pat}
+        pat.locals = ls
+        self.assertTupleEqual(pat.code, ("a=1", "pat.drop_code()", "b=2"))
+        pat.match("a")
+        self.assertDictEqual(ls, {"a": 1})
+        self.assertTupleEqual(pat.code, ())
+        self.assertDictEqual(pat.globals, {})
+        self.assertDictEqual(pat.locals, {})
+        self.assertDictEqual(pat.codeindex, {})
 
 def test_main():
     unittest.main(verbosity=2)

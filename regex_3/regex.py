@@ -104,7 +104,7 @@ The special characters are:
     (?{name}{code})     The code executed can be referenced by name.
     (?+{name}{code})    Named code that is executed on advancing. 
     (?-{name}{code})    Named code that is executed on backtracking.
-    (*{code})           Same as (?{code}) but certain optimisations are not
+    (*{code})           Same as (?{code}) but certain optimisations aren't
                         disabled.
     (*+{code})          Executes only on advancing.
     (*-{code})          Executes only on backtracking.
@@ -133,7 +133,8 @@ The special characters are:
     (??{code})          Evaluates the code and inserts the result into the
                         pattern.
     (??{name}{code})    Same as above, but the code can be referenced by name.
-    (??C=name)          Executes the referenced code and inserts the result
+                        ?? and ? code blocks have their own namespace.
+    (??C=name)          Evaluates the referenced code and inserts the result
                         into the pattern. All ?? code blocks are run left to
                         right after the whole pattern is parsed.
 
@@ -252,8 +253,7 @@ these flags can also be set within an RE:
                           when matching a bytestring.
     B   b   BESTMATCH     Find the best fuzzy match (default is first).
     C   c   CODE          Execute code during matching and evaluate code
-                          during parsing. Inline flag cannot be turned on
-                          within evaluated code.
+                          during parsing. Cannot be turned on when scoped.
     D       DEBUG         Print the parsed pattern.
     E   e   ENHANCEMATCH  Attempt to improve the fit after finding the first
                           fuzzy match.
@@ -268,7 +268,7 @@ these flags can also be set within an RE:
                           as well as the string. "$" matches the end of lines
                           (before a newline) as well as the end of the string.
     N   n   NO_CODE       Ignore all embedded code without evaluating it.
-                          Cannot be turned off within evaluated code.
+                          Cannot be turned off when scoped.
     P   p   POSIX         Perform POSIX-standard matching (leftmost longest).
     R   r   REVERSE       Searches backwards.
     S   s   DOTALL        "." matches any character at all, including the
@@ -540,8 +540,8 @@ _locale_sensitive = {}
 _MAXCACHE = 500
 _MAXREPCACHE = 500
 
-def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local_dict,
-  store):
+def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict,
+  local_dict, store):
     "Compiles a regular expression to a PatternObject."
 
     global DEFAULT_VERSION
@@ -646,7 +646,19 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
         raise error("unbalanced parenthesis", pattern, source.pos)
 
     if info.evaluated_code:
-        parsed = parsed.evaluate_code(source, info)
+        while True:
+            info.insertion_offset = 0
+            parsed = parsed.evaluate_code(source, info)
+
+            if not info.not_evaluated:
+                break
+
+            if not all(info.not_evaluated.values()):
+                remaining = {}
+                for elem, v in info.not_evaluated.items():
+                    if v:
+                        remaining[elem] = False
+                info.not_evaluated = remaining
 
         if isinstance(pattern, bytes):
             modified_pattern = bytes(source.modified, "latin-1")
@@ -753,7 +765,7 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict, local
 
     # Embedded code
     embedded_code = tuple(c for c in info.code_text.values() if c)
-    code_index = info.code_refs.copy()
+    code_index = info.code_index.copy()
 
     # Whether to store the passed globals and locals in the pattern.
     if store:

@@ -582,9 +582,11 @@ typedef struct PatternObject {
     PyObject* code; /* The uncompiled code. */
     PyObject* globals; /* The global dict for embedded code. */
     PyObject* locals; /* The local dict for embedded code. */
+    PyObject* state; /* StateObject while executing code. */
     size_t code_count;
     PyObject** compiled_code; /* Code that's already compiled. */
     PyObject* codeindex;
+    BOOL code_dropped; /* Whether all code has been removed. */
     PyObject* named_lists;
     size_t named_lists_count;
     PyObject** partial_named_lists[2];
@@ -11712,6 +11714,7 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
 
     dict = PyModule_GetDict(state->pattern->module);
     PyDict_SetItemString(dict, "state", (PyObject*)state_object);
+    state->pattern->state = (PyObject*)state_object;
 
     state->locked = TRUE;
     state->execute_time = clock();
@@ -11730,6 +11733,7 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     state_object->match = NULL;
     Py_DECREF(state_object);
     PyDict_SetItemString(dict, "state", Py_None);
+    state->pattern->state = NULL;
     state->locked = FALSE;
 
     /* Invalid code, error has already been set. */
@@ -12257,8 +12261,8 @@ advance:
             TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
               node->values[1]))
 
-            /* Skip code when CODE is not set. */
-            if (!state->run_code) {
+            /* Skip code when CODE is not set, or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
                 node = node->next_1.node;
                 break;
             }
@@ -12293,8 +12297,8 @@ advance:
             TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
               node->values[1]))
 
-            /* Skip code when CODE is not set. */
-            if (!state->run_code) {
+            /* Skip code when CODE is not set, or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
                 node = node->next_1.node;
                 break;
             }
@@ -15487,6 +15491,10 @@ backtrack:
 
             TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
               code_node->values[1]))
+
+            /* Code has been dropped. */
+            if (pattern->code_dropped)
+                break;
 
             status = code_run(state, code_node->status, code_node->values[0],
               code_node->values[1], FALSE, FALSE);
@@ -23928,6 +23936,42 @@ static PyObject* pattern_finditer(PatternObject* pattern, PyObject* args,
     return pattern_scanner(pattern, args, kwargs);
 }
 
+/* PatternObject's 'drop_code' method. */
+static PyObject* pattern_drop_code(PatternObject* pattern) {
+    size_t i;
+
+    if (pattern->code_dropped)
+        Py_RETURN_NONE;
+
+    pattern->code_dropped = TRUE;
+
+    if (pattern->code_count) {
+        for (i = 0; i < pattern->code_count; i++)
+            Py_XDECREF(pattern->compiled_code);
+
+        re_dealloc(pattern->compiled_code);
+    }
+    Py_XDECREF(pattern->globals);
+    Py_XDECREF(pattern->locals);
+    Py_XDECREF(pattern->code);
+    Py_XDECREF(pattern->codeindex);
+
+    pattern->globals = PyDict_New();
+    pattern->locals = PyDict_New();
+    pattern->code = PyTuple_New(0);
+    pattern->codeindex = PyDict_New();
+    if (!pattern->globals || !pattern->locals || !pattern->code ||
+      !pattern->codeindex) {
+        set_error(RE_ERROR_MEMORY, NULL);
+        return NULL;
+    }
+
+    pattern->compiled_code = NULL;
+    pattern->code_count = 0;
+
+    Py_RETURN_NONE;
+}
+
 /* Makes a copy of a PatternObject.
  *
  * It actually doesn't make a copy, just returns the original object.
@@ -24043,6 +24087,10 @@ PyDoc_STRVAR(pattern_scanner_doc,
     Return an scanner for the RE pattern in string.  The matches may be overlapped\n\
     if overlapped is True.");
 
+PyDoc_STRVAR(pattern_drop_code_doc,
+    "drop_code() --> None.\n\
+    Removes all embedded code from the pattern object.");
+
 /* The methods of a PatternObject. */
 static PyMethodDef pattern_methods[] = {
     {"match", (PyCFunction)pattern_match, METH_VARARGS|METH_KEYWORDS,
@@ -24069,6 +24117,8 @@ static PyMethodDef pattern_methods[] = {
       pattern_finditer_doc},
     {"scanner", (PyCFunction)pattern_scanner, METH_VARARGS|METH_KEYWORDS,
       pattern_scanner_doc},
+    {"drop_code", (PyCFunction)pattern_drop_code, METH_NOARGS,
+      pattern_drop_code_doc},
     {"__copy__", (PyCFunction)pattern_copy, METH_NOARGS},
     {"__deepcopy__", (PyCFunction)pattern_deepcopy, METH_O},
     {"__sizeof__", (PyCFunction)pattern_sizeof, METH_NOARGS|METH_COEXIST},
@@ -24448,7 +24498,7 @@ static PyObject* pattern_repr(PyObject* self_) {
     if (!append_string(list, "regex.Regex("))
         goto error;
 
-    item = PyObject_Repr(self->pattern);
+    item = PyObject_Repr(self->modified_pattern);
     if (!item)
         goto error;
 
@@ -24625,7 +24675,7 @@ static PyObject* pattern_pickled_data(PyObject* self_) {
 
     /* Build the data needed for picking.
      * The code flag is unset to avoid arbitrary code execution after
-     * unpickling and running unknown regex.
+     * unpickling and running an unknown regex.
      * Globals and locals are set to None to avoid pickling unrelated data and
      * because they're usually just references.
      */
@@ -26104,6 +26154,7 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
 
 /* Builds an EXEC_CODE node. */
 Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
+    BOOL optimistic;
     RE_UINT8 op;
     RE_Node* node;
 
@@ -26113,21 +26164,27 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
 
     switch (args->code[0]) {
     case RE_OP_EXEC_CODE_OPT:
-        args->locked_min_width = TRUE;
+        optimistic = TRUE;
         op = RE_OP_EXEC_CODE;
         break;
     case RE_OP_EXEC_CODE_ADV_OPT:
-        args->locked_min_width = TRUE;
+        optimistic = TRUE;
         op = RE_OP_EXEC_CODE_ADV;
         break;
     case RE_OP_EXEC_CODE_REV_OPT:
-        args->locked_min_width = TRUE;
+        optimistic = TRUE;
         op = RE_OP_EXEC_CODE_REV;
         break;
     default:
+        optimistic = FALSE;
         op = (RE_UINT8)args->code[0];
         break;
     }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
 
     int flags = 0;
     if (args->forward)
@@ -26163,7 +26220,7 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
     if (args->code + 3 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
-    if (args->code[0] == RE_OP_EXEC_CODE_CONDITIONAL_OPT)
+    if (args->code[0] != RE_OP_EXEC_CODE_CONDITIONAL_OPT)
         args->locked_min_width = TRUE;
 
     int flags = 0;
@@ -27765,9 +27822,11 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->code = embedded_code;
     self->globals = globals;
     self->locals = locals;
+    self->state = NULL;
     self->code_count = code_count;
     self->compiled_code = compiled_code;
     self->codeindex = codeindex;
+    self->code_dropped = FALSE;
     self->named_lists = named_lists;
     self->named_lists_count = (size_t)PyDict_Size(named_lists);
     self->partial_named_lists[0] = NULL;

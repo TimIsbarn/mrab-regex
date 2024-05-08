@@ -43,9 +43,9 @@ The ``ENHANCEMATCH`` flag makes fuzzy matching attempt to improve the fit of the
 
 The ``BESTMATCH`` flag makes fuzzy matching search for the best match instead of the next match.
 
-The ``CODE`` flag allows evaluation of embedded code during parsing. It also acts as a global flag for execution of code during matching.
+The ``CODE`` flag allows evaluation of embedded code during parsing. It also acts as a global flag for execution of code during matching. Setting this flag is forbidden if it was used as a scoped flag.
 
-The ``NO_CODE`` flag ignores all embedded code after parsing, this does not prevent evaluating code during parsing.
+The ``NO_CODE`` flag ignores all embedded code after parsing, this does not prevent evaluating code during parsing. Unsetting this flag is forbidden if it was used as a scoped flag.
 
 The ``HALT_TIMER`` flag ignores the time spent executing embedded code for measuring the timeout.
 
@@ -1055,20 +1055,21 @@ The matching methods and functions support timeouts. The timeout (in seconds) ap
       return pat.sub(repl, string, count, pos, endpos, concurrent, timeout)
   TimeoutError: regex timed out
 
-Embedded code
-^^^^^^^^^^^^^
+Embedded code ``(?{code})``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(?{code})`` or ``(?{name}{code})``
+``(?{name}{code})`` code can be referenced by the given name.
 
-Embedded code is executed whenever the engine encounters it. A reference to the ``StateObject`` can be gained via the module function ``state``.
+``(?+{code})`` or ``(?+{name}{code})`` executes only on advancing.
+
+``(?-{code})`` or ``(?-{name}{code})`` executes only on backtracking.
+
+Embedded code is executed whenever the engine encounters it.
+A reference to the ``StateObject`` can be gained via the module function ``state``.
 Using a ``StateObject`` outside the code block where it was created causes a ``TypeError``.
 The StateObject methods ``fail`` and ``advance`` cause the engine to advance or backtrack.
 Named code blocks can be referenced via that name.
 Globals and locals can be specified via the corresponding attributes in the methods for compiling and matching.
-
-* ``(?+{code})`` or ``(?+{name}{code})`` execute only on advancing.
-
-* ``(?-{code})`` or ``(?-{name}{code})`` execute only on backtracking.
 
 .. sourcecode:: python
 
@@ -1077,41 +1078,41 @@ Globals and locals can be specified via the corresponding attributes in the meth
   >>> pattern.match("b")
   <regex.Match object; span=(0, 1), match='b'>
 
-Optimistic code
-^^^^^^^^^^^^^^^
+Optimistic code ``(*{code})``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(*{code})`` or ``(*{name}{code})``
+``(*{name}{code})`` code can be referenced by the given name.
+
+``(*+{code})`` or ``(*+{name}{code})`` executes only on advancing.
+
+``(*-{code})`` or ``(*-{name}{code})`` executes only on backtracking.
 
 Embedded code disables certain optimizations to ensure running the code when execution would be expected.
-Optimistic code doesn't disable these optimizations, code may run less often than expected or not at all, especially on failure.
-
-* ``(*+{code})`` or ``(*+{name}{code})`` execute only on advancing.
-
-* ``(*-{code})`` or ``(*-{name}{code})`` execute only on backtracking.
+Optimistic code doesn't disable these optimizations, code may run less often than expected or not at all (especially on failure).
 
 .. sourcecode:: python
 
-  >> regex.match("(?c)(*+{print('0')})a(?{print('1')})", "b")
+  >> regex.match("(?c)a(?+{print('0')})b", "a")
   0
-  >> regex.match("(?c)(*+{print('0')})a(?{print('1')})", "a")
+  >> regex.match("(?c)a(?+{print('0')})b", "ab")
   0
-  1
-  <regex.Match object; span=(0, 1), match='a'>
+  <regex.Match object; span=(0, 2), match='ab'>
 
 The optimized code however doesn't run at all.
 
 .. sourcecode:: python
 
-  >> regex.match("(?c)(?+{print('0')})a(?{print('1')})", "b")
-  >> regex.match("(?c)(?+{print('0')})a(?{print('1')})", "a")
+  >> regex.match("(?c)a(*+{print('0')})b", "a")
+  >> regex.match("(?c)a(*+{print('0')})b", "ab")
   0
-  1
-  <regex.Match object; span=(0, 1), match='a'>
+  <regex.Match object; span=(0, 2), match='ab'>
 
-Code references
-^^^^^^^^^^^^^^^
+Code references ``(?C=name)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(?C=name)``, ``(?C+name)`` or ``(?C-name)``
+``(?C+name)`` executes only on advancing.
+
+``(?C-name)`` executes only on backtracking.
 
 Throws an exception if no code of the given name exists, otherwise behaves like embedded code using the referenced code.
 
@@ -1125,35 +1126,41 @@ Throws an exception if no code of the given name exists, otherwise behaves like 
   >>> pattern.match("b")
   None
 
-Optimistic code references
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+Optimistic code references ``(*C=name)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(*C=name)``, ``(*C+name)`` or ``(*C-name)``
+``(*C+name)`` executes only on advancing.
 
-Behave like code references without disabling certain optimizations.
+``(*C-name)`` executes only on backtracking.
 
-Code conditionals
-^^^^^^^^^^^^^^^^^
+Behaves like code references without disabling certain optimizations.
 
-``(?(?{code})yes|no)``, ``(?(?{name}{code})yes|no)`` or ``(?(?C=name)yes|no)``
+Code conditionals ``(?(?{code})yes|no)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The code is executed once to determine which branch to match next. If the ``fail`` method is called, the no_branch matches next, otherwise the yes_branch.
+``(?(?{name}{code})yes|no)`` code can be referenced by the given name.
 
-Optimistic code conditionals
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``(?(?C=name)yes|no)`` uses the referenced code instead.
 
-``(?(*{code})yes|no)``, ``(?(*{name}{code})yes|no)`` or ``(?(*C=name)yes|no)``
+The code is executed once to determine which branch to match next.
+If the ``fail`` method is called, the no_branch matches next, otherwise the yes_branch.
+
+Optimistic code conditionals ``(?(*{code})yes|no)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``(?(*{name}{code})yes|no)`` code can be referenced by the given name.
+
+``(?(*C=name)yes|no)`` uses the referenced code instead.
 
 Behave like code conditionals without disabling certain optimizations.
 
-Evaluated code
-^^^^^^^^^^^^^^
+Evaluated code ``(??{code})``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(??{code})`` or ``(??{name}{code})``
+``(??{name}{code})`` code can be referenced by the given name.
 
-Evaluates the code only when the ``CODE`` flag is set. The result has to be a string, which is then inserted into the pattern and parsed.
-The ``CODE`` flag cannot be turned on and the ``NO_CODE`` flag cannot be turned off within the result of evaluated code.
-If the ``NO_CODE`` flag is set, the code block will not be included in the ``PatternObject``, but still evaluated.
+Evaluates the code only when the ``CODE`` flag is set.
+The result has to be a string, which is then inserted into the pattern and parsed.
 The unmodified pattern is accessible via the attribute ``PatternObject.original_pattern``.
 
 .. sourcecode:: python
@@ -1164,10 +1171,9 @@ The unmodified pattern is accessible via the attribute ``PatternObject.original_
   >>> pat.original_pattern
   "(?c)(??{f('a')})"
 
-Evaluated Code references
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-``(??C=name)``
+Evaluated Code references ``(??C=name)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Throws an exception if no code of the given name exists, otherwise behaves like evaluated code.
 Evaluated code blocks are evaluated left to right, references can refer to code that is declared later.
+Evaluated references are iteratively evaluated to ensure that as many named references as possible are evaluated.
