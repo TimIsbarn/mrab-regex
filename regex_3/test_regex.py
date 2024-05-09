@@ -4540,8 +4540,8 @@ thing
 
         # 3 sequences of equal length consisting of different characters.
         pat = regex.compile("""(?cx)
-        ((.)\\2++)
-        ((.)\\4+)
+        ((.)\\2*+)
+        ((.)\\4*+)
         (?+{
             s = regex.state()
             g1 = s.group(1)
@@ -4550,20 +4550,24 @@ thing
                 s.fail()
             del s
         })
-        ((.)\\6+)
+        ((.)\\6*)
         (?{
             s = regex.state()
             g1 = s.group(1)
             g3 = s.group(5)
-            if (not (len(g1) == len(s.group(3)) == len(g3)) or not g1[0] == g3[0]:
+            if not (len(g1) == len(s.group(3)) == len(g3)) or g1[0] == g3[0]:
                 s.fail()
             del s
         })
         """, globals={"regex": regex})
-        self.assertIsNotNone(pat.fullmatch("aabbcc"))
-        self.assertIsNone(pat.fullmatch("aabbc"))
-        self.assertIsNone(pat.fullmatch("aabcc"))
-        self.assertIsNone(pat.fullmatch("abbcc"))
+        self.assertIsNotNone(pat.search("aabbcc"))
+        self.assertIsNone(pat.search("aabbc"))
+        self.assertIsNotNone(pat.search("aabcc"))
+        self.assertIsNone(pat.search("abbcc"))
+        self.assertEqual(pat.search("abcaabbcc").group(), "abc")
+        self.assertEqual(pat.search("abaabbcc").group(), "aabbcc")
+        self.assertEqual(pat.search("aaabbcc").group(), "aabbcc")
+        self.assertIsNone(pat.search("aabbaa"))
 
         # Ensure that globals, locals and CODE flag are unset upon pickling.
         ls = {"foo": True}
@@ -4688,7 +4692,7 @@ thing
 
         # Whether the engine advances is determined after the code block ends.
         pat = regex.compile(
-          "(?c)(?{regex.state().fail(); regex.state().advance()})a",
+          "(?c)(?{s = regex.state(); s.fail(); s.advance()})a",
           globals={"regex": regex})
         self.assertIsNotNone(pat.match("a"))
 
