@@ -1584,8 +1584,10 @@ def parse_subpattern(source, info, flags_on, flags_off):
         info.lock_code = locked_code = True
     if not info.lock_no_code and ((flags_on & NO_CODE) or (flags_off & NO_CODE)):
         info.lock_no_code = locked_no_code = True
+
     saved_flags = info.flags
     info.flags = (info.flags | flags_on) & ~flags_off
+
     source.ignore_space = bool(info.flags & VERBOSE)
 
     try:

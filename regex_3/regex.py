@@ -463,7 +463,8 @@ def cache_all(value=True):
 
 def template(pattern, flags=0):
     "Compile a template pattern, returning a pattern object."
-    return _compile(pattern, flags | TEMPLATE, False, {}, False, None, None, False)
+    return _compile(pattern, flags | TEMPLATE, False, {},
+      False, None, None, False)
 
 def escape(pattern, special_only=True, literal_spaces=False):
     """Escape a string for use as a literal in a pattern. If special_only is
@@ -576,8 +577,12 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict,
     if cache_it:
         try:
             # Do we know what keyword arguments are needed?
-            gk = tuple((global_dict or {}).keys())
-            lk = tuple((local_dict or {}).keys())
+            if store:
+                gk = tuple((global_dict or {}).keys())
+                lk = tuple((local_dict or {}).keys())
+            else:
+                gk = ()
+                lk = ()
             args_key = (pattern, type(pattern), flags, gk, lk)
             args_needed = _named_args[args_key]
 
@@ -624,10 +629,8 @@ def _compile(pattern, flags, ignore_unused, kwargs, cache_it, global_dict,
         caught_exception = None
         try:
             source = _Source(pattern)
-            #source.modified = source.string
             info = _Info(global_flags, source.char_type, kwargs, global_dict,
               local_dict)
-#            info.defer_code = True
             info.guess_encoding = guess_encoding
             source.ignore_space = bool(info.flags & VERBOSE)
             parsed = _parse_pattern(source, info)
@@ -861,8 +864,9 @@ def _compile_replacement_helper(pattern, template):
     return compiled
 
 # We define Pattern here after all the support objects have been defined.
-_pat = _compile("(?c)(?{State = type(state())})", 0, False,
-  {}, False, None, locals(), True)
+_pat = _compile("(?c)(?{State = type(state())})", 0,
+  False, {}, False, None, locals(),
+  True)
 Pattern = type(_pat)
 Match = type(_pat.match(''))
 del _pat

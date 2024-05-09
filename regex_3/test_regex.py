@@ -4464,11 +4464,9 @@ thing
         ls = {"func": func}
         pat = regex.compile("""(?cx)
         (?:
-            foo
-            (?{bar = 2})
+            foo (?{bar = 2})
         |
-            bar
-            (?{func(1)})
+            bar (?{func(1)})
         )
         (?{
             if bar == 2:
@@ -4476,15 +4474,14 @@ thing
             else:
                 baz = 4
         })
-        """,
-          locals=ls)
+        """, locals=ls)
         self.assertTupleEqual(pat.code, ("bar = 2", "func(1)",
           "if bar == 2:\n    baz = 3\nelse:\n    baz = 4"))
         self.assertDictEqual(pat.locals, ls)
         self.assertIsNone(pat.globals)
-        self.assertTrue(bool(pat.fullmatch("foo")))
+        self.assertIsNotNone(pat.fullmatch("foo"))
         self.assertDictEqual(ls, {"func": func, "bar": 2, "baz": 3})
-        self.assertTrue(bool(pat.fullmatch("bar")))
+        self.assertIsNotNone(pat.fullmatch("bar"))
         self.assertDictEqual(ls, {"func": func, "bar": 1, "baz": 4})
 
         # Changing variables while matching and evaluates code while parsing.
@@ -4494,25 +4491,24 @@ thing
             res = s * idx
             idx += 1
             return res
-        pat = regex.compile("(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)",
-          locals={"f": func})
+        pattern = "(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)"
+        pat = regex.compile(pattern, locals={"f": func})
         self.assertEqual(pat.pattern, "(?c)a aa aaa")
-        self.assertEqual(pat.original_pattern,
-          "(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)")
+        self.assertEqual(pat.original_pattern, pattern)
         # Evaluated code isn't stored in the pattern.
         self.assertTupleEqual(pat.code, ())
         self.assertDictEqual(pat.codeindex, {})
         self.assertEqual(idx, 4)
-        self.assertTrue(bool(pat.match("a aa aaa")))
+        self.assertIsNotNone(pat.match("a aa aaa"))
 
         # Code conditionals.
         pat = regex.compile(
-          "(?c)(?(?{if count == 2:\n\tregex.state().fail()})foo|bar)",
+          "(?c)(?(?{if foo == 2:\n\tregex.state().fail()})foo|bar)",
           globals={"regex": regex})
-        self.assertFalse(bool(pat.fullmatch("foo", locals={"count": 2})))
-        self.assertTrue(bool(pat.fullmatch("bar", locals={"count": 2})))
-        self.assertTrue(bool(pat.fullmatch("foo", locals={"count": 3})))
-        self.assertFalse(bool(pat.fullmatch("bar", locals={"count": 3})))
+        self.assertIsNone(pat.fullmatch("foo", locals={"foo": 2}))
+        self.assertIsNotNone(pat.fullmatch("bar", locals={"foo": 2}))
+        self.assertIsNotNone(pat.fullmatch("foo", locals={"foo": 3}))
+        self.assertIsNone(pat.fullmatch("bar", locals={"foo": 3}))
 
         # Get maximum depth of nested braces
         ls = {}
@@ -4537,9 +4533,9 @@ thing
             )
         )
         """, locals=ls)
-        self.assertTrue(bool(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{}}")))
+        self.assertIsNotNone(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{}}"))
         self.assertDictEqual(ls, {"depth": 0, "max_depth": 7})
-        self.assertTrue(bool(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{")))
+        self.assertIsNotNone(pat.fullmatch("{{}{{{}{}}{{}{{{}{{}}{}}{}}{}}}{"))
         self.assertDictEqual(ls, {"depth": 2, "max_depth": 7})
 
         # 3 sequences of equal length consisting of different characters.
@@ -4558,18 +4554,16 @@ thing
         (?{
             s = regex.state()
             g1 = s.group(1)
-            g2 = s.group(3)
             g3 = s.group(5)
-            if (not (len(g1) == len(g2) == len(g3)) or
-              not (g1[0] != g2[0] != g3[0])):
+            if (not (len(g1) == len(s.group(3)) == len(g3)) or not g1[0] == g3[0]:
                 s.fail()
             del s
         })
         """, globals={"regex": regex})
-        self.assertTrue(bool(pat.fullmatch("aabbcc")))
-        self.assertFalse(bool(pat.fullmatch("aabbc")))
-        self.assertFalse(bool(pat.fullmatch("aabcc")))
-        self.assertFalse(bool(pat.fullmatch("abbcc")))
+        self.assertIsNotNone(pat.fullmatch("aabbcc"))
+        self.assertIsNone(pat.fullmatch("aabbc"))
+        self.assertIsNone(pat.fullmatch("aabcc"))
+        self.assertIsNone(pat.fullmatch("abbcc"))
 
         # Ensure that globals, locals and CODE flag are unset upon pickling.
         ls = {"foo": True}
@@ -4621,29 +4615,29 @@ thing
 
         # Optimistic code doesn't disable certain optimizations.
         ls = {"c": 0}
-        self.assertTrue(bool(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
-          "a", locals=ls)))
+        self.assertIsNotNone(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+          "a", locals=ls))
         self.assertDictEqual(ls, {"c": 2})
         ls["c"] = 0
-        self.assertFalse(bool(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
-          "b", locals=ls)))
+        self.assertIsNone(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+          "b", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls["c"] = 0
-        self.assertFalse(bool(regex.match("(?c)(?C+foo)a(*{foo}{c += 1})",
-          "b", locals=ls)))
+        self.assertIsNone(regex.match("(?c)(?C+foo)a(*{foo}{c += 1})",
+          "b", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls["c"] = 0
-        self.assertFalse(bool(regex.match("(?c)(*C+foo)a(?{foo}{c += 1})",
-          "b", locals=ls)))
+        self.assertIsNone(regex.match("(?c)(*C+foo)a(?{foo}{c += 1})",
+          "b", locals=ls))
         self.assertDictEqual(ls, {"c": 0})
         ls = {}
         # Runs once despite the input string being shorter than the minimum width.
-        self.assertFalse(bool(regex.match("(?c)abc(?+{c = 1})def",
-          "abc", locals=ls)))
+        self.assertIsNone(regex.match("(?c)abc(?+{c = 1})def",
+          "abc", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls = {}
-        self.assertFalse(bool(regex.match("(?c)abc(*+{c = 1})def",
-          "abc", locals=ls)))
+        self.assertIsNone(regex.match("(?c)abc(*+{c = 1})def",
+          "abc", locals=ls))
         self.assertDictEqual(ls, {})
 
         # Correct nested error messages.
@@ -4663,8 +4657,7 @@ thing
 
         # 'drop_code' immediately removes all code and prevents further execution.
         ls = {}
-        pat = regex.compile(
-            "(?{a=1})(?{pat.drop_code()})(?{b=2})")
+        pat = regex.compile("(?{a=1})(?{pat.drop_code()})(?{b=2})")
         pat.run_code = True
         pat.globals = {"pat": pat}
         pat.locals = ls
@@ -4675,6 +4668,29 @@ thing
         self.assertDictEqual(pat.globals, {})
         self.assertDictEqual(pat.locals, {})
         self.assertDictEqual(pat.codeindex, {})
+
+        # 'run_code' stops running code.
+        ls = {}
+        pat = regex.compile("(?c)(?{a=1})(?{pat.state.run_code=False})(?{b=2})")
+        pat.globals = {"pat": pat}
+        pat.locals = ls
+        pat.match("a")
+        self.assertDictEqual(ls, {"a": 1})
+        ls.clear()
+        pat.match("a")
+        self.assertDictEqual(ls, {"a": 1})
+
+        # StateObject is invalid after the code block ends.
+        pat = regex.compile("(?c)(?{s = regex.state()})(?{s.advancing})")
+        pat.globals = {"regex": regex}
+        self.assertRaisesRegex(TypeError, "^state is invalid$",
+          lambda: pat.match("a"))
+
+        # Whether the engine advances is determined after the code block ends.
+        pat = regex.compile(
+          "(?c)(?{regex.state().fail(); regex.state().advance()})a",
+          globals={"regex": regex})
+        self.assertIsNotNone(pat.match("a"))
 
 def test_main():
     unittest.main(verbosity=2)

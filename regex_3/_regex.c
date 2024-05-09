@@ -140,7 +140,7 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_ERROR_BAD_TIMEOUT -15 /* "timeout" invalid. */
 #define RE_ERROR_TIMED_OUT -16 /* Matching has timed out. */
 #define RE_ERROR_LOCKED -17 /* Attempt to match on a locked state. */
-#define RE_ERROR_INVALID_STATE -18 /* Attempt to use an invalidated state object. */
+#define RE_ERROR_INVALID_STATE -18 /* Attempted to use an invalidated state object. */
 #define RE_ERROR_BAD_GLOBALS -19 /* Globals have to be a dict. */
 #define RE_ERROR_BAD_LOCALS -20 /* Locals has to support mapping. */
 
@@ -11633,8 +11633,8 @@ static PyTypeObject State_Type = {
 };
 
 /* Returns a new StateObject. */
-Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state, RE_STATUS_T status,
-  BOOL advance, BOOL in_conditional) {
+Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state,
+  RE_STATUS_T status, BOOL advance, BOOL in_conditional) {
     PyObject* match;
     StateObject* result;
 
@@ -11714,6 +11714,8 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
 
     dict = PyModule_GetDict(state->pattern->module);
     PyDict_SetItemString(dict, "state", (PyObject*)state_object);
+    Py_DECREF(state->pattern->state);
+    /* No need for a second strong reference. */
     state->pattern->state = (PyObject*)state_object;
 
     state->locked = TRUE;
@@ -11723,7 +11725,7 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     result = PyEval_EvalCode(code_obj, state->globals, state->locals);
 
     if (halt_timer)
-        state->skipped_time += (clock() - state->execute_time);
+        state->skipped_time += clock() - state->execute_time;
 
     advance = state_object->advance;
 
@@ -11733,7 +11735,9 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     state_object->match = NULL;
     Py_DECREF(state_object);
     PyDict_SetItemString(dict, "state", Py_None);
-    state->pattern->state = NULL;
+    state->pattern->state = Py_None;
+    Py_INCREF(state->pattern->state);
+
     state->locked = FALSE;
 
     /* Invalid code, error has already been set. */
@@ -12251,70 +12255,6 @@ advance:
             } else
                 goto backtrack;
             break;
-        case RE_OP_EXEC_CODE:
-        case RE_OP_EXEC_CODE_ADV:
-        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
-        {
-            int status;
-
-            /* args: code_id, halt_timer. */
-            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
-              node->values[1]))
-
-            /* Skip code when CODE is not set, or code has been dropped. */
-            if (!state->run_code || pattern->code_dropped) {
-                node = node->next_1.node;
-                break;
-            }
-
-            if (node->op != RE_OP_EXEC_CODE_REV) {
-                status = code_run(state, node->status, node->values[0],
-                  node->values[1], TRUE, FALSE);
-
-                if (status == RE_ERROR_FAILURE)
-                    goto backtrack;
-                else if (status != RE_ERROR_SUCCESS)
-                    return status;
-            }
-
-            if (node->op != RE_OP_EXEC_CODE_ADV) {
-                if (!push_pointer(state, &state->bstack, node))
-                    return RE_ERROR_MEMORY;
-                if (!push_uint8(state, &state->bstack, node->op))
-                    return RE_ERROR_MEMORY;
-
-                /* bstack: code_node op */
-            }
-
-            node = node->next_1.node;
-            break;
-        }
-        case RE_OP_EXEC_CODE_CONDITIONAL: /* Embedded python code conditional. */
-        {
-            int status;
-
-            /* args: code_id, halt_timer. */
-            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
-              node->values[1]))
-
-            /* Skip code when CODE is not set, or code has been dropped. */
-            if (!state->run_code || pattern->code_dropped) {
-                node = node->next_1.node;
-                break;
-            }
-
-            status = code_run(state, node->status, node->values[0],
-              node->values[1], TRUE, TRUE);
-
-            if (status == RE_ERROR_SUCCESS)
-                node = node->next_1.node;
-            else if (status == RE_ERROR_FAILURE)
-                node = node->nonstring.next_2.node;
-            else
-                return status;
-
-            break;
-        }
         case RE_OP_CONDITIONAL: /* Start of a conditional subpattern. */
         {
             RE_LookaroundStateData data_l;
@@ -13232,6 +13172,70 @@ advance:
             } else
                 goto backtrack;
             break;
+        case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_ADV:
+        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
+        {
+            int status;
+
+            /* args: code_id, halt_timer. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            if (node->op != RE_OP_EXEC_CODE_REV) {
+                status = code_run(state, node->status, node->values[0],
+                  node->values[1], TRUE, FALSE);
+
+                if (status == RE_ERROR_FAILURE)
+                    goto backtrack;
+                else if (status != RE_ERROR_SUCCESS)
+                    return status;
+            }
+
+            if (node->op != RE_OP_EXEC_CODE_ADV) {
+                if (!push_pointer(state, &state->bstack, node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_EXEC_CODE_CONDITIONAL: /* Embedded python code conditional. */
+        {
+            int status;
+
+            /* args: code_id, halt_timer. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_run(state, node->status, node->values[0],
+              node->values[1], TRUE, TRUE);
+
+            if (status == RE_ERROR_SUCCESS)
+                node = node->next_1.node;
+            else if (status == RE_ERROR_FAILURE)
+                node = node->nonstring.next_2.node;
+            else
+                return status;
+
+            break;
+        }
         case RE_OP_FAILURE: /* Failure. */
             goto backtrack;
         case RE_OP_FUZZY: /* Fuzzy matching. */
@@ -15476,44 +15480,6 @@ backtrack:
             if (!drop_pointer(state, &state->sstack))
                 return RE_ERROR_MEMORY;
             break;
-        case RE_OP_EXEC_CODE:
-        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
-        {
-            RE_Node* code_node;
-            int status;
-
-            /* bstack: code_node */
-
-            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
-                return RE_ERROR_MEMORY;
-
-            /* bstack: - */
-
-            TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
-              code_node->values[1]))
-
-            /* Code has been dropped. */
-            if (pattern->code_dropped)
-                break;
-
-            status = code_run(state, code_node->status, code_node->values[0],
-              code_node->values[1], FALSE, FALSE);
-
-            if (status == RE_ERROR_FAILURE)
-                break;
-            else if (status != RE_ERROR_SUCCESS)
-                return status;
-
-            if (!push_pointer(state, &state->bstack, code_node))
-                return RE_ERROR_MEMORY;
-            if (!push_uint8(state, &state->bstack, code_node->op))
-                return RE_ERROR_MEMORY;
-
-            /* bstack: code_node op */
-
-            node = code_node->next_1.node;
-            goto advance;
-        }
         case RE_OP_CONDITIONAL: /* Conditional subpattern. */
         {
             RE_Node* conditional;
@@ -15816,6 +15782,44 @@ backtrack:
              * pstack: -
              */
             break;
+        }
+        case RE_OP_EXEC_CODE:
+        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
+        {
+            RE_Node* code_node;
+            int status;
+
+            /* bstack: code_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
+              code_node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped)
+                break;
+
+            status = code_run(state, code_node->status, code_node->values[0],
+              code_node->values[1], FALSE, FALSE);
+
+            if (status == RE_ERROR_FAILURE)
+                break;
+            else if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            if (!push_pointer(state, &state->bstack, code_node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, code_node->op))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node op */
+
+            node = code_node->next_1.node;
+            goto advance;
         }
         case RE_OP_FAILURE: /* Failure. */
             TRACE(("%s\n", re_op_text[op]))
@@ -20926,11 +20930,10 @@ static PyObject* state_repr(PyObject* self_) {
     if (!append_integer(list, (Py_ssize_t)self))
         goto error;
 
-    if (self->valid)
-        if (!append_string(list, "; valid>")) {
+    if (self->valid) {
+        if (!append_string(list, "; valid>"))
             goto error;
-        }
-    else if (!append_string(list, "; invalid>"))
+    } else if (!append_string(list, "; invalid>"))
         goto error;
 
     separator = Py_BuildValue("U", "");
@@ -20980,7 +20983,7 @@ PyDoc_STRVAR(state_fail_doc,
   "fail() --> None.\n\
   Causes the engine to backtrack after the execution of code ends.");
 
-/* MatchObject's methods. */
+/* StateObject's methods. */
 static PyMethodDef state_methods[] = {
     {"group", (PyCFunction)state_group, METH_VARARGS, match_group_doc},
     {"start", (PyCFunction)state_start, METH_VARARGS, match_start_doc},
@@ -21016,8 +21019,50 @@ static PyMethodDef state_methods[] = {
 
 PyDoc_STRVAR(state_doc, "State object");
 
+/* StateObject's 'run_code' getter method. */
+static PyObject* state_run_code_get(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->state->run_code)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
+}
+
+/* StateObject's 'run_code' setter method. */
+static int state_run_code_set(PyObject* self_, PyObject* value, void* unused) {
+    StateObject* self;
+    int status;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return -1;
+    }
+
+    status = PyObject_IsTrue(value);
+    if (status < 0)
+        return status;
+
+    self->state->run_code = status ? TRUE : FALSE;
+
+    return 0;
+}
+
 /* StateObject's 'advancing' attribute. */
-static PyObject* state_advancing(StateObject* self, void* unused) {
+static PyObject* state_advancing(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21030,7 +21075,11 @@ static PyObject* state_advancing(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'in_conditional' attribute. */
-static PyObject* state_in_conditional(StateObject* self, void* unused) {
+static PyObject* state_in_conditional(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21043,7 +21092,11 @@ static PyObject* state_in_conditional(StateObject* self, void* unused) {
 }
 
 /* StateObject's 're' attribute. */
-static PyObject* state_pattern(StateObject* self, void* unused) {
+static PyObject* state_pattern(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21054,7 +21107,11 @@ static PyObject* state_pattern(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'string' attribute. */
-static PyObject* state_string(StateObject* self, void* unused) {
+static PyObject* state_string(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21064,7 +21121,11 @@ static PyObject* state_string(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'lastindex' attribute. */
-static PyObject* state_lastindex(StateObject* self, void* unused) {
+static PyObject* state_lastindex(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21074,7 +21135,11 @@ static PyObject* state_lastindex(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'lastgroup' attribute. */
-static PyObject* state_lastgroup(StateObject* self, void* unused) {
+static PyObject* state_lastgroup(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21084,7 +21149,11 @@ static PyObject* state_lastgroup(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'regs' attribute. */
-static PyObject* state_regs(StateObject* self, void* unused) {
+static PyObject* state_regs(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21094,7 +21163,11 @@ static PyObject* state_regs(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'fuzzy_counts' attribute. */
-static PyObject* state_fuzzy_counts(StateObject* self, void* unused) {
+static PyObject* state_fuzzy_counts(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21104,7 +21177,11 @@ static PyObject* state_fuzzy_counts(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'fuzzy_changes' attribute. */
-static PyObject* state_fuzzy_changes(StateObject* self, void* unused) {
+static PyObject* state_fuzzy_changes(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21114,7 +21191,11 @@ static PyObject* state_fuzzy_changes(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'pos' attribute. */
-static PyObject* state_pos(StateObject* self, void* unused) {
+static PyObject* state_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21124,7 +21205,11 @@ static PyObject* state_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'endpos' attribute. */
-static PyObject* state_endpos(StateObject* self, void* unused) {
+static PyObject* state_endpos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21134,7 +21219,11 @@ static PyObject* state_endpos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'globals' attribute. */
-static PyObject* state_globals(StateObject* self, void* unused) {
+static PyObject* state_globals(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21145,7 +21234,11 @@ static PyObject* state_globals(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'locals' attribute. */
-static PyObject* state_locals(StateObject* self, void* unused) {
+static PyObject* state_locals(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21156,7 +21249,11 @@ static PyObject* state_locals(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'charsize' attribute. */
-static PyObject* state_charsize(StateObject* self, void* unused) {
+static PyObject* state_charsize(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21166,7 +21263,11 @@ static PyObject* state_charsize(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'text_length' attribute. */
-static PyObject* state_text_length(StateObject* self, void* unused) {
+static PyObject* state_text_length(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21176,7 +21277,11 @@ static PyObject* state_text_length(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'slice_start' attribute. */
-static PyObject* state_slice_start(StateObject* self, void* unused) {
+static PyObject* state_slice_start(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21186,7 +21291,11 @@ static PyObject* state_slice_start(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'slice_end' attribute. */
-static PyObject* state_slice_end(StateObject* self, void* unused) {
+static PyObject* state_slice_end(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21196,7 +21305,11 @@ static PyObject* state_slice_end(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'text_start' attribute. */
-static PyObject* state_text_start(StateObject* self, void* unused) {
+static PyObject* state_text_start(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21206,7 +21319,11 @@ static PyObject* state_text_start(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'text_end' attribute. */
-static PyObject* state_text_end(StateObject* self, void* unused) {
+static PyObject* state_text_end(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21216,7 +21333,11 @@ static PyObject* state_text_end(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'search_anchor' attribute. */
-static PyObject* state_search_anchor(StateObject* self, void* unused) {
+static PyObject* state_search_anchor(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21226,7 +21347,11 @@ static PyObject* state_search_anchor(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'match_pos' attribute. */
-static PyObject* state_match_pos(StateObject* self, void* unused) {
+static PyObject* state_match_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21236,7 +21361,11 @@ static PyObject* state_match_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'text_pos' attribute. */
-static PyObject* state_text_pos(StateObject* self, void* unused) {
+static PyObject* state_text_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21246,7 +21375,11 @@ static PyObject* state_text_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'final_newline' attribute. */
-static PyObject* state_final_newline(StateObject* self, void* unused) {
+static PyObject* state_final_newline(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21256,7 +21389,11 @@ static PyObject* state_final_newline(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'final_line_sep' attribute. */
-static PyObject* state_final_line_sep(StateObject* self, void* unused) {
+static PyObject* state_final_line_sep(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21266,7 +21403,11 @@ static PyObject* state_final_line_sep(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'sstack' attribute. */
-static PyObject* state_sstack(StateObject* self, void* unused) {
+static PyObject* state_sstack(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21277,7 +21418,11 @@ static PyObject* state_sstack(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'bstack' attribute. */
-static PyObject* state_bstack(StateObject* self, void* unused) {
+static PyObject* state_bstack(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21288,7 +21433,11 @@ static PyObject* state_bstack(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'pstack' attribute. */
-static PyObject* state_pstack(StateObject* self, void* unused) {
+static PyObject* state_pstack(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21299,7 +21448,11 @@ static PyObject* state_pstack(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'best_match_pos' attribute. */
-static PyObject* state_best_match_pos(StateObject* self, void* unused) {
+static PyObject* state_best_match_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21309,7 +21462,11 @@ static PyObject* state_best_match_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'best_text_pos' attribute. */
-static PyObject* state_best_text_pos(StateObject* self, void* unused) {
+static PyObject* state_best_text_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21319,7 +21476,11 @@ static PyObject* state_best_text_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'min_width' attribute. */
-static PyObject* state_min_width(StateObject* self, void* unused) {
+static PyObject* state_min_width(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21329,7 +21490,11 @@ static PyObject* state_min_width(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'total_errors' attribute. */
-static PyObject* state_total_errors(StateObject* self, void* unused) {
+static PyObject* state_total_errors(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21339,7 +21504,11 @@ static PyObject* state_total_errors(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'max_errors' attribute. */
-static PyObject* state_max_errors(StateObject* self, void* unused) {
+static PyObject* state_max_errors(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21349,7 +21518,11 @@ static PyObject* state_max_errors(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'fewest_errors' attribute. */
-static PyObject* state_fewest_errors(StateObject* self, void* unused) {
+static PyObject* state_fewest_errors(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21359,7 +21532,11 @@ static PyObject* state_fewest_errors(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'capture_change' attribute. */
-static PyObject* state_capture_change(StateObject* self, void* unused) {
+static PyObject* state_capture_change(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21369,7 +21546,11 @@ static PyObject* state_capture_change(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'req_pos' attribute. */
-static PyObject* state_req_pos(StateObject* self, void* unused) {
+static PyObject* state_req_pos(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21379,7 +21560,11 @@ static PyObject* state_req_pos(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'req_end' attribute. */
-static PyObject* state_req_end(StateObject* self, void* unused) {
+static PyObject* state_req_end(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21389,7 +21574,11 @@ static PyObject* state_req_end(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'timeout' attribute. */
-static PyObject* state_timeout(StateObject* self, void* unused) {
+static PyObject* state_timeout(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21399,7 +21588,11 @@ static PyObject* state_timeout(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'start_time' attribute. */
-static PyObject* state_start_time(StateObject* self, void* unused) {
+static PyObject* state_start_time(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21409,7 +21602,11 @@ static PyObject* state_start_time(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'execute_time' attribute. */
-static PyObject* state_execute_time(StateObject* self, void* unused) {
+static PyObject* state_execute_time(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21419,7 +21616,11 @@ static PyObject* state_execute_time(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'skipped_time' attribute. */
-static PyObject* state_skipped_time(StateObject* self, void* unused) {
+static PyObject* state_skipped_time(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21429,7 +21630,11 @@ static PyObject* state_skipped_time(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'partial_side' attribute. */
-static PyObject* state_partial_side(StateObject* self, void* unused) {
+static PyObject* state_partial_side(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21439,7 +21644,11 @@ static PyObject* state_partial_side(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'iterations' attribute. */
-static PyObject* state_iterations(StateObject* self, void* unused) {
+static PyObject* state_iterations(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21449,7 +21658,11 @@ static PyObject* state_iterations(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'is_unicode' attribute. */
-static PyObject* state_is_unicode(StateObject* self, void* unused) {
+static PyObject* state_is_unicode(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21462,7 +21675,11 @@ static PyObject* state_is_unicode(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'should_release' attribute. */
-static PyObject* state_should_release(StateObject* self, void* unused) {
+static PyObject* state_should_release(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21475,7 +21692,11 @@ static PyObject* state_should_release(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'overlapped' attribute. */
-static PyObject* state_overlapped(StateObject* self, void* unused) {
+static PyObject* state_overlapped(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21488,7 +21709,11 @@ static PyObject* state_overlapped(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'reverse' attribute. */
-static PyObject* state_reverse(StateObject* self, void* unused) {
+static PyObject* state_reverse(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21501,7 +21726,11 @@ static PyObject* state_reverse(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'visible_captures' attribute. */
-static PyObject* state_visible_captures(StateObject* self, void* unused) {
+static PyObject* state_visible_captures(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21514,7 +21743,11 @@ static PyObject* state_visible_captures(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'version_0' attribute. */
-static PyObject* state_version_0(StateObject* self, void* unused) {
+static PyObject* state_version_0(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21527,7 +21760,11 @@ static PyObject* state_version_0(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'must_advance' attribute. */
-static PyObject* state_must_advance(StateObject* self, void* unused) {
+static PyObject* state_must_advance(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21540,7 +21777,11 @@ static PyObject* state_must_advance(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'is_multithreaded' attribute. */
-static PyObject* state_is_multithreaded(StateObject* self, void* unused) {
+static PyObject* state_is_multithreaded(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21553,7 +21794,11 @@ static PyObject* state_is_multithreaded(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'too_few_errors' attribute. */
-static PyObject* state_too_few_errors(StateObject* self, void* unused) {
+static PyObject* state_too_few_errors(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21566,7 +21811,11 @@ static PyObject* state_too_few_errors(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'match_all' attribute. */
-static PyObject* state_match_all(StateObject* self, void* unused) {
+static PyObject* state_match_all(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21579,7 +21828,11 @@ static PyObject* state_match_all(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'found_match' attribute. */
-static PyObject* state_found_match(StateObject* self, void* unused) {
+static PyObject* state_found_match(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21592,7 +21845,11 @@ static PyObject* state_found_match(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'is_fuzzy' attribute. */
-static PyObject* state_is_fuzzy(StateObject* self, void* unused) {
+static PyObject* state_is_fuzzy(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21605,7 +21862,11 @@ static PyObject* state_is_fuzzy(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'backtracking' attribute. */
-static PyObject* state_backtracking(StateObject* self, void* unused) {
+static PyObject* state_backtracking(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21618,7 +21879,11 @@ static PyObject* state_backtracking(StateObject* self, void* unused) {
 }
 
 /* StateObject's 'locked' attribute. */
-static PyObject* state_locked(StateObject* self, void* unused) {
+static PyObject* state_locked(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
@@ -21631,6 +21896,8 @@ static PyObject* state_locked(StateObject* self, void* unused) {
 }
 
 static PyGetSetDef state_getset[] = {
+    {"run_code", (getter)state_run_code_get, (setter)state_run_code_set,
+      "Whether to execute or skip embedded code."},
     {"advancing", (getter)state_advancing, (setter)NULL,
       "Whether the engine advances after execution ends."},
     {"in_conditional", (getter)state_in_conditional, (setter)NULL,
@@ -23960,14 +24227,13 @@ static PyObject* pattern_drop_code(PatternObject* pattern) {
     pattern->locals = PyDict_New();
     pattern->code = PyTuple_New(0);
     pattern->codeindex = PyDict_New();
+    pattern->compiled_code = NULL;
+    pattern->code_count = 0;
     if (!pattern->globals || !pattern->locals || !pattern->code ||
       !pattern->codeindex) {
         set_error(RE_ERROR_MEMORY, NULL);
         return NULL;
     }
-
-    pattern->compiled_code = NULL;
-    pattern->code_count = 0;
 
     Py_RETURN_NONE;
 }
@@ -24184,6 +24450,7 @@ static void pattern_dealloc(PyObject* self_) {
     Py_XDECREF(self->indexgroup);
     Py_XDECREF(self->globals);
     Py_XDECREF(self->locals);
+    Py_XDECREF(self->state);
     Py_XDECREF(self->code);
     Py_XDECREF(self->codeindex);
 
@@ -24583,8 +24850,11 @@ static PyObject* pattern_run_code_get(PyObject* self_) {
     PatternObject* self;
 
     self = (PatternObject*)self_;
+    
+    if (self->flags & RE_FLAG_CODE)
+        Py_RETURN_TRUE;
 
-    return Py_BuildValue("n", self->flags & RE_FLAG_CODE);
+    Py_RETURN_TRUE;
 }
 
 /* PatternObject's 'run_code' setter method. */
@@ -24596,7 +24866,7 @@ static int pattern_run_code_set(PyObject* self_, PyObject* value) {
     if (PyObject_IsTrue(value))
         self->flags |= RE_FLAG_CODE;
     else
-        self->flags |= ~RE_FLAG_CODE;
+        self->flags &= ~RE_FLAG_CODE;
 
     return 0;
 }
@@ -24710,6 +24980,8 @@ static PyMemberDef pattern_members[] = {
       "The pattern string from which the regex object was compiled."},
     {"original_pattern", T_OBJECT, offsetof(PatternObject, pattern), READONLY,
       "The pattern before it was parsed."},
+    {"state", T_OBJECT, offsetof(PatternObject, state), READONLY,
+      "The internal state during matching."},
     {"flags", T_PYSSIZET, offsetof(PatternObject, flags), READONLY,
       "The regex matching flags."},
     {"groups", T_PYSSIZET, offsetof(PatternObject, public_group_count),
@@ -27822,7 +28094,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->code = embedded_code;
     self->globals = globals;
     self->locals = locals;
-    self->state = NULL;
+    self->state = Py_None;
     self->code_count = code_count;
     self->compiled_code = compiled_code;
     self->codeindex = codeindex;
@@ -27862,6 +28134,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     Py_INCREF(self->indexgroup);
     Py_INCREF(self->globals);
     Py_INCREF(self->locals);
+    Py_INCREF(self->state);
     Py_INCREF(self->code);
     Py_INCREF(self->codeindex);
     Py_INCREF(self->named_lists);
