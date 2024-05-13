@@ -4502,13 +4502,49 @@ thing
         self.assertIsNotNone(pat.match("a aa aaa"))
 
         # Code conditionals.
-        pat = regex.compile(
-          "(?c)(?(?{if foo == 2:\n\tregex.state().fail()})foo|bar)",
-          globals={"regex": regex})
-        self.assertIsNone(pat.fullmatch("foo", locals={"foo": 2}))
-        self.assertIsNotNone(pat.fullmatch("bar", locals={"foo": 2}))
-        self.assertIsNotNone(pat.fullmatch("foo", locals={"foo": 3}))
-        self.assertIsNone(pat.fullmatch("bar", locals={"foo": 3}))
+        pat = regex.compile("""(?cx)
+        (?(?{
+            if foo == 0:
+                regex.state().case(-1)
+            elif foo == 1:
+                regex.state().case(0)
+            elif foo == 2:
+                regex.state().case(1)
+            elif foo == 3:
+                regex.state().case(2)
+            elif foo == 4:
+                regex.state().case(3)
+            elif foo == 5:
+                regex.state().fail()
+            elif foo == 6:
+                regex.state().advance()
+            elif foo == 7:
+                regex.state().case("abc")
+        })
+            abc
+        |
+            def
+        |
+            ghi
+        )
+        z
+        """, globals={"regex": regex})
+        self.assertRaisesRegex(ValueError, "^case index has to be positive$",
+          lambda: pat.match("abcz", locals={"foo": 0}))
+        self.assertIsNotNone(pat.match("abcz", locals={"foo": 1}))
+        self.assertIsNotNone(pat.match("defz", locals={"foo": 2}))
+        self.assertIsNotNone(pat.match("ghiz", locals={"foo": 3}))
+        self.assertRaisesRegex(ValueError, "^case index should be no more than 2$",
+          lambda: pat.match("abcz", locals={"foo": 4}))
+        self.assertIsNone(pat.match("abcz", locals={"foo": 5}))
+        self.assertIsNone(pat.match("abcz", locals={"foo": 6}))
+        self.assertIsNotNone(pat.match("z", locals={"foo": 6}))
+        self.assertRaisesRegex(TypeError, "^case index must be an integer$",
+          lambda: pat.match("abcz", locals={"foo": 7}))
+
+        self.assertRaisesRegex(TypeError, "^case only allowed in conditionals$",
+          lambda: regex.match("(?c)(?{regex.state().case(0)})",
+          "abc", globals={"regex": regex}))
 
         # Get maximum depth of nested braces
         ls = {}
@@ -4685,7 +4721,7 @@ thing
         self.assertDictEqual(ls, {"a": 1})
 
         # StateObject is invalid after the code block ends.
-        pat = regex.compile("(?c)(?{s = regex.state()})(?{s.advancing})")
+        pat = regex.compile("(?c)(?{s = regex.state()})(?{s.fail()})")
         pat.globals = {"regex": regex}
         self.assertRaisesRegex(TypeError, "^state is invalid$",
           lambda: pat.match("a"))

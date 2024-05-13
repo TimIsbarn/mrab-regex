@@ -217,6 +217,10 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_FUZZY_VAL_DEL_COST (RE_FUZZY_VAL_COST_BASE + RE_FUZZY_DEL)
 #define RE_FUZZY_VAL_MAX_COST (RE_FUZZY_VAL_COST_BASE + RE_FUZZY_ERR)
 
+#define RE_CODE_NOTHING -1
+#define RE_CODE_ADVANCE -2
+#define RE_CODE_FAIL -3
+
 /* The maximum number of errors when trying to improve a fuzzy match. */
 #define RE_MAX_ERRORS 10
 
@@ -322,6 +326,8 @@ typedef struct RE_Node {
     Py_ssize_t step;
     size_t value_count;
     RE_CODE* values;
+    size_t node_count;
+    RE_NextNode* nodes;
     RE_STATUS_T status;
     RE_UINT8 op;
     BOOL match;
@@ -651,6 +657,9 @@ typedef struct StateObject {
     RE_State* state;
     RE_STATUS_T status;
     BOOL advance;
+    BOOL fail;
+    Py_ssize_t case_index;
+    Py_ssize_t max_index;
     BOOL in_conditional;
     BOOL valid;
 } StateObject;
@@ -11634,7 +11643,7 @@ static PyTypeObject State_Type = {
 
 /* Returns a new StateObject. */
 Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state,
-  RE_STATUS_T status, BOOL advance, BOOL in_conditional) {
+  RE_STATUS_T status, BOOL in_conditional, Py_ssize_t max_index) {
     PyObject* match;
     StateObject* result;
 
@@ -11651,7 +11660,10 @@ Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state,
     result->match = (MatchObject*)match;
     result->state = state;
     result->status = status;
-    result->advance = advance;
+    result->advance = FALSE;
+    result->fail = FALSE;
+    result->case_index = -1;
+    result->max_index = max_index;
     result->in_conditional = in_conditional;
     result->valid = TRUE;
 
@@ -11690,13 +11702,13 @@ Py_LOCAL_INLINE(PyObject*) get_code(RE_State* state, RE_CODE code_id) {
 }
 
 /* Runs embedded code. */
-Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
-  RE_CODE code_id, RE_CODE halt_timer, BOOL def, BOOL in_conditional) {
+Py_LOCAL_INLINE(int) code_run(RE_State* state, Py_ssize_t* code_result,
+  RE_STATUS_T status, RE_CODE code_id, RE_CODE halt_timer, BOOL in_conditional,
+  Py_ssize_t max_index) {
     StateObject* state_object;
     PyObject* dict;
     PyObject* code_obj;
     PyObject* result;
-    BOOL advance;
 
     TRACE(("<<code>>\n"))
 
@@ -11707,8 +11719,7 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     if (!code_obj)
         return RE_ERROR_MEMORY;
 
-    state->backtracking = !def;
-    state_object = new_state_object(state, status, def, in_conditional);
+    state_object = new_state_object(state, status, in_conditional, max_index);
     if (!state_object)
         return RE_ERROR_MEMORY;
 
@@ -11727,7 +11738,19 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     if (halt_timer)
         state->skipped_time += clock() - state->execute_time;
 
-    advance = state_object->advance;
+    if (state_object->case_index >= 0) {
+        TRACE(("    code_result: %d\n", state_object->case_index))
+        *code_result = state_object->case_index;
+    } else if (state_object->advance) {
+        TRACE(("    code_result: ADVANCE\n"))
+        *code_result = RE_CODE_ADVANCE;
+    } else if (state_object->fail) {
+        TRACE(("    code_result: FAIL\n"))
+        *code_result = RE_CODE_FAIL;
+    } else {
+        TRACE(("    code_result: NOTHING\n"))
+        *code_result = RE_CODE_NOTHING;
+    }
 
     /* StateObject should no longer be used. */
     state_object->valid = FALSE;    
@@ -11752,7 +11775,7 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, RE_STATUS_T status,
     /* Release the GIL. */
     release_GIL(state);
 
-    return advance ? RE_ERROR_SUCCESS : RE_ERROR_FAILURE;
+    return RE_ERROR_SUCCESS;
 }
 
 /* Performs a depth-first match or search from the context. */
@@ -13177,6 +13200,7 @@ advance:
         case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
         {
             int status;
+            Py_ssize_t code_result;
 
             /* args: code_id, halt_timer. */
             TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
@@ -13189,13 +13213,17 @@ advance:
             }
 
             if (node->op != RE_OP_EXEC_CODE_REV) {
-                status = code_run(state, node->status, node->values[0],
-                  node->values[1], TRUE, FALSE);
+                state->backtracking = FALSE;
+                status = code_run(state, &code_result, node->status,
+                  node->values[0], node->values[1], FALSE, 0);
 
-                if (status == RE_ERROR_FAILURE)
-                    goto backtrack;
-                else if (status != RE_ERROR_SUCCESS)
+                if (status != RE_ERROR_SUCCESS)
                     return status;
+
+                switch (code_result) {
+                case RE_CODE_FAIL:
+                    goto backtrack;
+                }
             }
 
             if (node->op != RE_OP_EXEC_CODE_ADV) {
@@ -13213,6 +13241,7 @@ advance:
         case RE_OP_EXEC_CODE_CONDITIONAL: /* Embedded python code conditional. */
         {
             int status;
+            Py_ssize_t code_result;
 
             /* args: code_id, halt_timer. */
             TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
@@ -13224,15 +13253,25 @@ advance:
                 break;
             }
 
-            status = code_run(state, node->status, node->values[0],
-              node->values[1], TRUE, TRUE);
+            state->backtracking = FALSE;
+            status = code_run(state, &code_result, node->status,
+              node->values[0], node->values[1], TRUE,
+              (Py_ssize_t)node->node_count);
 
-            if (status == RE_ERROR_SUCCESS)
-                node = node->next_1.node;
-            else if (status == RE_ERROR_FAILURE)
-                node = node->nonstring.next_2.node;
-            else
+            if (status != RE_ERROR_SUCCESS)
                 return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                node = node->next_1.node;
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                node = node->nodes[code_result].node;
+                break;
+            }
 
             break;
         }
@@ -15788,6 +15827,7 @@ backtrack:
         {
             RE_Node* code_node;
             int status;
+            Py_ssize_t code_result;
 
             /* bstack: code_node */
 
@@ -15803,23 +15843,27 @@ backtrack:
             if (!state->run_code || pattern->code_dropped)
                 break;
 
-            status = code_run(state, code_node->status, code_node->values[0],
-              code_node->values[1], FALSE, FALSE);
+            state->backtracking = TRUE;
+            status = code_run(state, &code_result, code_node->status,
+              code_node->values[0], code_node->values[1], FALSE, 0);
 
-            if (status == RE_ERROR_FAILURE)
-                break;
-            else if (status != RE_ERROR_SUCCESS)
+            if (status != RE_ERROR_SUCCESS)
                 return status;
 
-            if (!push_pointer(state, &state->bstack, code_node))
-                return RE_ERROR_MEMORY;
-            if (!push_uint8(state, &state->bstack, code_node->op))
-                return RE_ERROR_MEMORY;
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+                if (!push_pointer(state, &state->bstack, code_node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, code_node->op))
+                    return RE_ERROR_MEMORY;
 
-            /* bstack: code_node op */
+                /* bstack: code_node op */
 
-            node = code_node->next_1.node;
-            goto advance;
+                node = code_node->next_1.node;
+                goto advance;
+            }
+
+            break;
         }
         case RE_OP_FAILURE: /* Failure. */
             TRACE(("%s\n", re_op_text[op]))
@@ -20959,6 +21003,8 @@ static PyObject* state_advance(StateObject* self) {
     }
 
     self->advance = TRUE;
+    self->fail = FALSE;
+    self->case_index = -1;
 
     Py_RETURN_NONE;
 }
@@ -20971,6 +21017,43 @@ static PyObject* state_fail(StateObject* self) {
     }
 
     self->advance = FALSE;
+    self->fail = TRUE;
+    self->case_index = -1;
+
+    Py_RETURN_NONE;
+}
+
+/* StateObject's 'case' method. */
+static PyObject* state_case(StateObject* self, PyObject* arg) {
+    Py_ssize_t index;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    } else if (!self->in_conditional) {
+        PyErr_SetString(PyExc_TypeError, "case only allowed in conditionals");
+        return NULL;
+    } else if (!PyLong_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError, "case index must be an integer");
+        return NULL;
+    }
+
+    index = (Py_ssize_t)PyLong_AsLong(arg);
+    if (index == -1 && PyErr_Occurred())
+        return NULL;
+
+    if (index < 0) {
+        PyErr_SetString(PyExc_ValueError, "case index has to be positive");
+        return NULL;
+    } else if (index >= self->max_index) {
+        PyErr_Format(PyExc_ValueError, "case index should be no more than %zu",
+          self->max_index - 1);
+        return NULL;
+    } else {
+        self->advance = FALSE;
+        self->fail = FALSE;
+        self->case_index = index;
+    }
 
     Py_RETURN_NONE;
 }
@@ -20982,6 +21065,10 @@ PyDoc_STRVAR(state_advance_doc,
 PyDoc_STRVAR(state_fail_doc,
   "fail() --> None.\n\
   Causes the engine to backtrack after the execution of code ends.");
+
+PyDoc_STRVAR(state_case_doc,
+  "case(num: int) --> None.\n\
+  Only in conditional, matches the specified branch next.");
 
 /* StateObject's methods. */
 static PyMethodDef state_methods[] = {
@@ -21007,6 +21094,7 @@ static PyMethodDef state_methods[] = {
     {"allspans", (PyCFunction)state_allspans, METH_NOARGS, match_allspans_doc},
     {"advance", (PyCFunction)state_advance, METH_NOARGS, state_advance_doc},
     {"fail", (PyCFunction)state_fail, METH_NOARGS, state_fail_doc},
+    {"case", (PyCFunction)state_case, METH_O, state_case_doc},
     {"__copy__", (PyCFunction)state_copy, METH_NOARGS},
     {"__deepcopy__", (PyCFunction)state_deepcopy, METH_O},
     {"__getitem__", (PyCFunction)state_getitem, METH_O|METH_COEXIST},
@@ -21055,23 +21143,6 @@ static int state_run_code_set(PyObject* self_, PyObject* value, void* unused) {
     self->state->run_code = status ? TRUE : FALSE;
 
     return 0;
-}
-
-/* StateObject's 'advancing' attribute. */
-static PyObject* state_advancing(PyObject* self_, void* unused) {
-    StateObject* self;
-
-    self = (StateObject*)self_;
-
-    if (!self->valid) {
-        set_error(RE_ERROR_INVALID_STATE, NULL);
-        return NULL;
-    }
-
-    if (self->advance)
-        Py_RETURN_TRUE;
-
-    Py_RETURN_FALSE;
 }
 
 /* StateObject's 'in_conditional' attribute. */
@@ -21898,8 +21969,6 @@ static PyObject* state_locked(PyObject* self_, void* unused) {
 static PyGetSetDef state_getset[] = {
     {"run_code", (getter)state_run_code_get, (setter)state_run_code_set,
       "Whether to execute or skip embedded code."},
-    {"advancing", (getter)state_advancing, (setter)NULL,
-      "Whether the engine advances after execution ends."},
     {"in_conditional", (getter)state_in_conditional, (setter)NULL,
       "Whether the code is used as a conditional."},
     {"pattern", (getter)state_pattern, (setter)NULL,
@@ -24397,6 +24466,16 @@ static PyMethodDef pattern_methods[] = {
 
 PyDoc_STRVAR(pattern_doc, "Compiled regex object");
 
+Py_LOCAL_INLINE(void) node_dealloc(RE_Node* node) {
+    re_dealloc(node->values);
+    re_dealloc(node->nodes);
+    if (node->status & RE_STATUS_STRING) {
+        re_dealloc(node->string.bad_character_offset);
+        re_dealloc(node->string.good_suffix_offset);
+    }
+    re_dealloc(node);
+}
+
 /* Deallocates a PatternObject. */
 static void pattern_dealloc(PyObject* self_) {
     PatternObject* self;
@@ -24406,17 +24485,8 @@ static void pattern_dealloc(PyObject* self_) {
     self = (PatternObject*)self_;
 
     /* Discard the nodes. */
-    for (i = 0; i < self->node_count; i++) {
-        RE_Node* node;
-
-        node = self->node_list[i];
-        re_dealloc(node->values);
-        if (node->status & RE_STATUS_STRING) {
-            re_dealloc(node->string.bad_character_offset);
-            re_dealloc(node->string.good_suffix_offset);
-        }
-        re_dealloc(node);
-    }
+    for (i = 0; i < self->node_count; i++)
+        node_dealloc(self->node_list[i]);
     re_dealloc(self->node_list);
 
     /* Discard the group info. */
@@ -24850,7 +24920,7 @@ static PyObject* pattern_run_code_get(PyObject* self_) {
     PatternObject* self;
 
     self = (PatternObject*)self_;
-    
+
     if (self->flags & RE_FLAG_CODE)
         Py_RETURN_TRUE;
 
@@ -25010,6 +25080,7 @@ Py_LOCAL_INLINE(void) skip_one_way_branches(PatternObject* pattern) {
      */
     do {
         size_t i;
+        size_t j;
 
         modified = FALSE;
 
@@ -25041,6 +25112,16 @@ Py_LOCAL_INLINE(void) skip_one_way_branches(PatternObject* pattern) {
               !next->nonstring.true_node) {
                 node->nonstring.true_node = next->next_1.node;
                 modified = TRUE;
+            }
+
+            /* Check the node array. */
+            for (j = 0; j < node->node_count; j++) {
+                next = node->nodes[j].node;
+                if (next && next->op == RE_OP_BRANCH &&
+                  !next->nonstring.next_2.node) {
+                    node->nodes[j].node = next->next_1.node;
+                    modified = TRUE;
+                }
             }
         }
     } while (modified);
@@ -25162,6 +25243,50 @@ Py_LOCAL_INLINE(RE_STATUS_T) add_repeat_guards(PatternObject* pattern, RE_Node*
             case RE_OP_END_LAZY_REPEAT:
                 node->status |= RE_STATUS_VISITED_AG;
                 break;
+            case RE_OP_EXEC_CODE_CONDITIONAL:
+            {
+                RE_Node* tail;
+                BOOL visited_all;
+                Py_ssize_t i;
+
+                tail = node->next_1.node;
+
+                if (!tail) {
+                    node->status |= RE_STATUS_VISITED_AG | result;
+                    break;
+                }
+
+                visited_all = tail->status & RE_STATUS_VISITED_AG;
+                for (i = 0; i < node->node_count && visited_all; i++)
+                    visited_all = (node->nodes[i].node->status &
+                      RE_STATUS_VISITED_AG);
+
+                if (visited_all) {
+                    RE_STATUS_T max_result;
+
+                    max_result = max_status_2(result, tail->status &
+                      (RE_STATUS_REPEAT | RE_STATUS_REF));
+
+                    for (i = 0; i < node->node_count; i++)
+                        max_result = max_status_2(max_result,
+                          node->nodes[i].node->status & (RE_STATUS_REPEAT |
+                          RE_STATUS_REF));
+
+                    node->status |= RE_STATUS_VISITED_AG | max_result;
+                } else {
+                    CheckStack_push(&stack, node, result);
+
+                    for (i = node->node_count - 1; i >= 0; i--)
+                        if (!(node->nodes[i].node->status &
+                          RE_STATUS_VISITED_AG))
+                            CheckStack_push(&stack, node->nodes[i].node,
+                              RE_STATUS_NEITHER);
+
+                    if (!(tail->status & RE_STATUS_VISITED_AG))
+                        CheckStack_push(&stack, tail, RE_STATUS_NEITHER);
+                }
+                break;
+            }
             case RE_OP_GREEDY_REPEAT:
             case RE_OP_LAZY_REPEAT:
             {
@@ -25405,6 +25530,15 @@ Py_LOCAL_INLINE(BOOL) record_subpattern_repeats_and_fuzzy_sections(RE_Node*
         case RE_OP_END_GREEDY_REPEAT:
         case RE_OP_END_LAZY_REPEAT:
             return TRUE;
+        case RE_OP_EXEC_CODE_CONDITIONAL:
+            size_t i;
+            
+            for (i = 0; i < node->node_count; i++)
+                if (!record_subpattern_repeats_and_fuzzy_sections(parent_node,
+                  offset, repeat_count, node->nodes[i].node))
+                    return FALSE;
+            node = node->next_1.node;
+            break;
         case RE_OP_FUZZY:
             /* Record the fuzzy index. */
             if (!add_index(parent_node, offset, repeat_count +
@@ -25485,6 +25619,7 @@ Py_LOCAL_INLINE(RE_Node*) NodeStack_pop(RE_NodeStack* stack) {
 /* Marks nodes which are being used as used. */
 Py_LOCAL_INLINE(void) use_nodes(RE_Node* node) {
     RE_NodeStack stack;
+    size_t i;
 
     NodeStack_init(&stack);
 
@@ -25495,6 +25630,8 @@ Py_LOCAL_INLINE(void) use_nodes(RE_Node* node) {
                 if (node->nonstring.next_2.node)
                     NodeStack_push(&stack, node->nonstring.next_2.node);
             }
+            for (i = 0; i < node->node_count; i++)
+                NodeStack_push(&stack, node->nodes[i].node);
             node = node->next_1.node;
         }
         node = NodeStack_pop(&stack);
@@ -25526,6 +25663,7 @@ Py_LOCAL_INLINE(void) discard_unused_nodes(PatternObject* pattern) {
             pattern->node_list[new_count++] = node;
         else {
             re_dealloc(node->values);
+            re_dealloc(node->nodes);
             if (node->status & RE_STATUS_STRING) {
                 re_dealloc(node->string.bad_character_offset);
                 re_dealloc(node->string.good_suffix_offset);
@@ -25674,6 +25812,7 @@ Py_LOCAL_INLINE(void) set_test_node(RE_NextNode* next) {
 Py_LOCAL_INLINE(void) set_test_nodes(PatternObject* pattern) {
     RE_Node** node_list;
     size_t i;
+    size_t j;
 
     node_list = pattern->node_list;
     for (i = 0; i < pattern->node_count; i++) {
@@ -25683,6 +25822,8 @@ Py_LOCAL_INLINE(void) set_test_nodes(PatternObject* pattern) {
         set_test_node(&node->next_1);
         if (!(node->status & RE_STATUS_STRING))
             set_test_node(&node->nonstring.next_2);
+        for (j = 0; j < node->node_count; j++)
+            set_test_node(&node->nodes[j].node);
     }
 }
 
@@ -25731,7 +25872,7 @@ Py_LOCAL_INLINE(BOOL) optimise_pattern(PatternObject* pattern) {
 
 /* Creates a new pattern node. */
 Py_LOCAL_INLINE(RE_Node*) create_node(PatternObject* pattern, RE_UINT8 op,
-  RE_CODE flags, Py_ssize_t step, size_t value_count) {
+  RE_CODE flags, Py_ssize_t step, size_t value_count, size_t node_count) {
     RE_Node* node;
 
     node = (RE_Node*)re_alloc(sizeof(*node));
@@ -25743,10 +25884,22 @@ Py_LOCAL_INLINE(RE_Node*) create_node(PatternObject* pattern, RE_UINT8 op,
 
     if (node->value_count > 0) {
         node->values = (RE_CODE*)re_alloc(node->value_count * sizeof(RE_CODE));
-        if (!node->values)
-            goto error;
+        if (!node->values) {
+            re_dealloc(node);
+            return NULL;
+        }
     } else
         node->values = NULL;
+
+    node->node_count = node_count;
+
+    if (node->node_count > 0) {
+        node->nodes = (RE_NextNode*)re_alloc(node->node_count *
+          sizeof(RE_NextNode));
+        if (!node->nodes)
+            goto error;
+    } else
+        node->nodes = NULL;
 
     node->op = op;
     node->match = (flags & RE_POSITIVE_OP) != 0;
@@ -25779,6 +25932,7 @@ Py_LOCAL_INLINE(RE_Node*) create_node(PatternObject* pattern, RE_UINT8 op,
 
 error:
     re_dealloc(node->values);
+    re_dealloc(node->nodes);
     re_dealloc(node);
     return NULL;
 }
@@ -26039,7 +26193,7 @@ Py_LOCAL_INLINE(int) build_ANY(RE_CompileArgs* args) {
     step = get_step(op);
 
     /* Create the node. */
-    node = create_node(args->pattern, op, flags, step, 0);
+    node = create_node(args->pattern, op, flags, step, 0, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26077,8 +26231,8 @@ Py_LOCAL_INLINE(int) build_FUZZY(RE_CompileArgs* args) {
     flags = args->code[1];
 
     /* Create nodes for the start and end of the fuzzy sequence. */
-    start_node = create_node(args->pattern, RE_OP_FUZZY, flags, 0, 13);
-    end_node = create_node(args->pattern, RE_OP_END_FUZZY, flags, 0, 0);
+    start_node = create_node(args->pattern, RE_OP_FUZZY, flags, 0, 13, 0);
+    end_node = create_node(args->pattern, RE_OP_END_FUZZY, flags, 0, 0, 0);
     if (!start_node || !end_node)
         return RE_ERROR_MEMORY;
 
@@ -26169,7 +26323,7 @@ Py_LOCAL_INLINE(int) build_ATOMIC(RE_CompileArgs* args) {
     if (args->code + 1 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
-    atomic_node = create_node(args->pattern, RE_OP_ATOMIC, 0, 0, 0);
+    atomic_node = create_node(args->pattern, RE_OP_ATOMIC, 0, 0, 0, 0);
     if (!atomic_node)
         return RE_ERROR_MEMORY;
 
@@ -26205,7 +26359,7 @@ Py_LOCAL_INLINE(int) build_ATOMIC(RE_CompileArgs* args) {
         atomic_node->status |= RE_STATUS_HAS_REPEATS;
 
     /* Create the node to terminate the subpattern. */
-    end_node = create_node(subargs.pattern, RE_OP_END_ATOMIC, 0, 0, 0);
+    end_node = create_node(subargs.pattern, RE_OP_END_ATOMIC, 0, 0, 0, 0);
     if (!end_node)
         return RE_ERROR_MEMORY;
 
@@ -26234,7 +26388,7 @@ Py_LOCAL_INLINE(int) build_BOUNDARY(RE_CompileArgs* args) {
     args->code += 2;
 
     /* Create the node. */
-    node = create_node(args->pattern, op, flags, 0, 0);
+    node = create_node(args->pattern, op, flags, 0, 0, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26259,8 +26413,8 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
         return RE_ERROR_ILLEGAL;
 
     /* Create nodes for the start and end of the branch sequence. */
-    branch_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
-    join_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    branch_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
+    join_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     if (!branch_node || !join_node)
         return RE_ERROR_MEMORY;
 
@@ -26302,7 +26456,8 @@ Py_LOCAL_INLINE(int) build_BRANCH(RE_CompileArgs* args) {
         add_node(subargs.end, join_node);
 
         /* Create a start node for the next sequence and append it. */
-        next_branch_node = create_node(subargs.pattern, RE_OP_BRANCH, 0, 0, 0);
+        next_branch_node = create_node(subargs.pattern, RE_OP_BRANCH, 0, 0, 0,
+          0);
         if (!next_branch_node)
             return RE_ERROR_MEMORY;
 
@@ -26342,8 +26497,8 @@ Py_LOCAL_INLINE(int) build_CALL_REF(RE_CompileArgs* args) {
     args->code += 2;
 
     /* Create nodes for the start and end of the subpattern. */
-    start_node = create_node(args->pattern, RE_OP_CALL_REF, 0, 0, 1);
-    end_node = create_node(args->pattern, RE_OP_GROUP_RETURN, 0, 0, 0);
+    start_node = create_node(args->pattern, RE_OP_CALL_REF, 0, 0, 1, 0);
+    end_node = create_node(args->pattern, RE_OP_GROUP_RETURN, 0, 0, 0, 0);
     if (!start_node || !end_node)
         return RE_ERROR_MEMORY;
 
@@ -26406,7 +26561,7 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
         step = 0;
 
     /* Create the node. */
-    node = create_node(args->pattern, op, flags, step, 1);
+    node = create_node(args->pattern, op, flags, step, 1, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26463,7 +26618,7 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
         flags |= RE_STATUS_REVERSE;
 
     /* Create the node. */
-    node = create_node(args->pattern, op, flags, 0, 2);
+    node = create_node(args->pattern, op, flags, 0, 2, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26481,15 +26636,17 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
 
 /* Builds an EXEC_CODE_CONDITIONAL node. */
 Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
-    RE_Node* start_node;
-    RE_Node* end_node;
+    size_t node_count;
+    RE_Node* case_node;
+    RE_Node* join_node;
     RE_CompileArgs subargs;
     int status;
     Py_ssize_t min_width;
     BOOL locked;
+    size_t index;
 
-    /* codes: opcode, code_id, halt_timer, ..., next, ..., end. */
-    if (args->code + 3 > args->end_code)
+    /* codes: opcode, code_id, halt_timer, case_count, next, ..., end. */
+    if (args->code + 4 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
     if (args->code[0] != RE_OP_EXEC_CODE_CONDITIONAL_OPT)
@@ -26500,81 +26657,62 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
         flags |= RE_STATUS_REVERSE;
 
     /* Create nodes for the start and end of the structure. */
-    start_node = create_node(args->pattern, RE_OP_EXEC_CODE_CONDITIONAL, flags, 0, 2);
-    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
-    if (!start_node || !end_node)
+    case_node = create_node(args->pattern, RE_OP_EXEC_CODE_CONDITIONAL, flags,
+      0, 2, (size_t)args->code[3]);
+    join_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
+    if (!case_node || !join_node)
         return RE_ERROR_MEMORY;
 
-    start_node->values[0] = args->code[1];
-    start_node->values[1] = args->code[2];
+    case_node->values[0] = args->code[1];
+    case_node->values[1] = args->code[2];
 
-    args->code += 3;
+    args->code += 4;
 
+    /* Append the node. */
+    add_node(args->end, case_node);
+    add_node(case_node, join_node);
+    args->end = join_node;
+
+    min_width = PY_SSIZE_T_MAX;
     locked = args->locked_min_width;
 
     subargs = *args;
-    status = build_sequence(&subargs);
-    if (status != RE_ERROR_SUCCESS)
-        return status;
+    index = 0;
 
-    args->code = subargs.code;
-    args->has_captures |= subargs.has_captures;
-    args->is_fuzzy |= subargs.is_fuzzy;
-    args->has_groups |= subargs.has_groups;
-    args->has_repeats |= subargs.has_repeats;
-    args->visible_capture_count = subargs.visible_capture_count;
-    args->locked_min_width |= subargs.locked_min_width;
+    while (subargs.code < subargs.end_code && subargs.code[0] == RE_OP_NEXT) {
+        /* Skip over the 'NEXT' opcode. */
+        ++subargs.code;
 
-    min_width = subargs.min_width;
-
-    /* Append the start node. */
-    add_node(args->end, start_node);
-    add_node(start_node, subargs.start);
-
-    if (args->code[0] == RE_OP_NEXT) {
-        RE_Node* true_branch_end;
-
-        ++args->code;
-
-        true_branch_end = subargs.end;
-
-        subargs.code = args->code;
         subargs.locked_min_width = locked;
 
+        /* Compile the sequence until the next 'NEXT' opcode. */
         status = build_sequence(&subargs);
         if (status != RE_ERROR_SUCCESS)
             return status;
 
-        args->code = subargs.code;
+        min_width = min_ssize_t(min_width, subargs.min_width);
+
         args->has_captures |= subargs.has_captures;
         args->is_fuzzy |= subargs.is_fuzzy;
         args->has_groups |= subargs.has_groups;
         args->has_repeats |= subargs.has_repeats;
-        args->visible_capture_count = subargs.visible_capture_count;
         args->locked_min_width |= subargs.locked_min_width;
 
-        min_width = min_ssize_t(min_width, subargs.min_width);
-
-        add_node(start_node, subargs.start);
-        add_node(true_branch_end, end_node);
-
-        add_node(subargs.end, end_node);
-    } else {
-        add_node(start_node, end_node);
-        add_node(subargs.end, end_node);
-
-        min_width = 0;
+        case_node->nodes[index++].node = subargs.start;
+        add_node(subargs.end, join_node);
     }
 
+    /* We should have reached the end of the conditional. */
+    if (subargs.code[0] != RE_OP_END)
+        return RE_ERROR_ILLEGAL;
+
+    args->code = subargs.code;
+    args->visible_capture_count = subargs.visible_capture_count;
+
+    ++args->code;
     if (!locked)
         args->min_width += min_width;
 
-    if (args->code[0] != RE_OP_END)
-        return RE_ERROR_ILLEGAL;
-
-    ++args->code;
-
-    args->end = end_node;
     args->all_atomic = FALSE;
 
     return RE_ERROR_SUCCESS;
@@ -26600,7 +26738,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     forward = (BOOL)args->code[2];
 
     /* Create a node for the lookaround. */
-    test_node = create_node(args->pattern, RE_OP_CONDITIONAL, flags, 0, 0);
+    test_node = create_node(args->pattern, RE_OP_CONDITIONAL, flags, 0, 0, 0);
     if (!test_node)
         return RE_ERROR_MEMORY;
 
@@ -26638,7 +26776,8 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
         test_node->status |= RE_STATUS_HAS_REPEATS;
 
     /* Create the node to terminate the test. */
-    end_test_node = create_node(args->pattern, RE_OP_END_CONDITIONAL, 0, 0, 0);
+    end_test_node = create_node(args->pattern, RE_OP_END_CONDITIONAL, 0, 0, 0,
+      0);
     if (!end_test_node)
         return RE_ERROR_MEMORY;
 
@@ -26666,7 +26805,7 @@ Py_LOCAL_INLINE(int) build_CONDITIONAL(RE_CompileArgs* args) {
     min_width = subargs.min_width;
 
     /* Create the terminating node. */
-    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     if (!end_node)
         return RE_ERROR_MEMORY;
 
@@ -26743,9 +26882,9 @@ Py_LOCAL_INLINE(int) build_GROUP(RE_CompileArgs* args) {
 
     /* Create nodes for the start and end of the capture group. */
     start_node = create_node(args->pattern, forward ? RE_OP_START_GROUP :
-      RE_OP_END_GROUP, 0, 0, 3);
+      RE_OP_END_GROUP, 0, 0, 3, 0);
     end_node = create_node(args->pattern, forward ? RE_OP_END_GROUP :
-      RE_OP_START_GROUP, 0, 0, 3);
+      RE_OP_START_GROUP, 0, 0, 3, 0);
     if (!start_node || !end_node)
         return RE_ERROR_MEMORY;
 
@@ -26812,7 +26951,7 @@ Py_LOCAL_INLINE(int) build_GROUP_CALL(RE_CompileArgs* args) {
     call_ref = args->code[1];
 
     /* Create the node. */
-    node = create_node(args->pattern, RE_OP_GROUP_CALL, 0, 0, 1);
+    node = create_node(args->pattern, RE_OP_GROUP_CALL, 0, 0, 1, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -26860,8 +26999,8 @@ Py_LOCAL_INLINE(int) build_GROUP_EXISTS(RE_CompileArgs* args) {
         return RE_ERROR_MEMORY;
 
     /* Create nodes for the start and end of the structure. */
-    start_node = create_node(args->pattern, RE_OP_GROUP_EXISTS, 0, 0, 1);
-    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    start_node = create_node(args->pattern, RE_OP_GROUP_EXISTS, 0, 0, 1, 0);
+    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     if (!start_node || !end_node)
         return RE_ERROR_MEMORY;
 
@@ -26968,7 +27107,7 @@ Py_LOCAL_INLINE(int) build_LOOKAROUND(RE_CompileArgs* args) {
 
     /* Create a node for the lookaround. */
     lookaround_node = create_node(args->pattern, RE_OP_LOOKAROUND, flags, 0,
-      0);
+      0, 0);
     if (!lookaround_node)
         return RE_ERROR_MEMORY;
 
@@ -27004,12 +27143,12 @@ Py_LOCAL_INLINE(int) build_LOOKAROUND(RE_CompileArgs* args) {
         lookaround_node->status |= RE_STATUS_HAS_REPEATS;
 
     /* Create the node to terminate the subpattern. */
-    end_node = create_node(args->pattern, RE_OP_END_LOOKAROUND, 0, 0, 0);
+    end_node = create_node(args->pattern, RE_OP_END_LOOKAROUND, 0, 0, 0, 0);
     if (!end_node)
         return RE_ERROR_MEMORY;
 
     /* Make a continuation node. */
-    next_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    next_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     if (!next_node)
         return RE_ERROR_MEMORY;
 
@@ -27046,7 +27185,7 @@ Py_LOCAL_INLINE(int) build_RANGE(RE_CompileArgs* args) {
         step = 0;
 
     /* Create the node. */
-    node = create_node(args->pattern, op, flags, step, 2);
+    node = create_node(args->pattern, op, flags, step, 2, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -27077,7 +27216,7 @@ Py_LOCAL_INLINE(int) build_REF_GROUP(RE_CompileArgs* args) {
 
     flags = args->code[1];
     group = args->code[2];
-    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 1);
+    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 1, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -27195,7 +27334,7 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
             /* Create the nodes for the repeat. */
             repeat_node = create_node(args->pattern, greedy ?
               RE_OP_GREEDY_REPEAT : RE_OP_LAZY_REPEAT, 0, args->forward ? 1 :
-              -1, 4);
+              -1, 4, 0);
             if (!repeat_node || !record_repeat(args->pattern, index,
               args->repeat_depth))
                 return RE_ERROR_MEMORY;
@@ -27255,7 +27394,7 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
 
                 end_repeat_node = create_node(args->pattern, greedy ?
                   RE_OP_END_GREEDY_REPEAT : RE_OP_END_LAZY_REPEAT, 0,
-                  args->forward ? 1 : -1, 4);
+                  args->forward ? 1 : -1, 4, 0);
                 if (!end_repeat_node)
                     return RE_ERROR_MEMORY;
 
@@ -27264,7 +27403,8 @@ Py_LOCAL_INLINE(int) build_REPEAT(RE_CompileArgs* args) {
                 end_repeat_node->values[2] = repeat_node->values[2];
                 end_repeat_node->values[3] = args->forward;
 
-                end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+                end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0,
+                  0);
                 if (!end_node)
                     return RE_ERROR_MEMORY;
 
@@ -27312,7 +27452,7 @@ Py_LOCAL_INLINE(int) build_STRING(RE_CompileArgs* args, BOOL is_charset) {
 
     /* Create the node. */
     node = create_node(args->pattern, op, flags, step * (Py_ssize_t)length,
-      length);
+      length, 0);
     if (!node)
         return RE_ERROR_MEMORY;
     if (!is_charset)
@@ -27327,7 +27467,7 @@ Py_LOCAL_INLINE(int) build_STRING(RE_CompileArgs* args, BOOL is_charset) {
     add_node(args->end, node);
     args->end = node;
 
-    if (!args->locked_min_width)
+    if (!args->locked_min_width) {
         /* Because of full case-folding, one character in the text could match
          * multiple characters in the pattern.
          */
@@ -27335,6 +27475,7 @@ Py_LOCAL_INLINE(int) build_STRING(RE_CompileArgs* args, BOOL is_charset) {
             args->min_width += possible_unfolded_length((Py_ssize_t)length);
         else
             args->min_width += (Py_ssize_t)length;
+    }
 
     return RE_ERROR_SUCCESS;
 }
@@ -27358,7 +27499,7 @@ Py_LOCAL_INLINE(int) build_SET(RE_CompileArgs* args) {
     if (flags & RE_ZEROWIDTH_OP)
         step = 0;
 
-    node = create_node(args->pattern, op, flags, step, 0);
+    node = create_node(args->pattern, op, flags, step, 0, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -27434,7 +27575,7 @@ Py_LOCAL_INLINE(int) build_SUCCESS(RE_CompileArgs* args) {
     /* codes: opcode. */
 
     /* Create the node. */
-    node = create_node(args->pattern, (RE_UINT8)args->code[0], 0, 0, 0);
+    node = create_node(args->pattern, (RE_UINT8)args->code[0], 0, 0, 0, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -27459,7 +27600,7 @@ Py_LOCAL_INLINE(int) build_zerowidth(RE_CompileArgs* args) {
     flags = args->code[1];
 
     /* Create the node. */
-    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 0);
+    node = create_node(args->pattern, (RE_UINT8)args->code[0], flags, 0, 0, 0);
     if (!node)
         return RE_ERROR_MEMORY;
 
@@ -27477,7 +27618,7 @@ Py_LOCAL_INLINE(int) build_charset_equiv(RE_CompileArgs* args) {
     int status;
 
     /* Guarantee that there's something to attach to. */
-    args->start = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    args->start = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     args->end = args->start;
 
     /* The following code groups opcodes by format, not function. */
@@ -27549,7 +27690,7 @@ Py_LOCAL_INLINE(int) build_sequence(RE_CompileArgs* args) {
     int status;
 
     /* Guarantee that there's something to attach to. */
-    args->start = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0);
+    args->start = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     args->end = args->start;
 
     args->min_width = 0;
@@ -27885,7 +28026,7 @@ Py_LOCAL_INLINE(RE_Node*) make_STRING_node(PatternObject* pattern, RE_UINT8 op,
     step = get_step(op);
 
     /* Create the node. */
-    node = create_node(pattern, op, 0, step * (Py_ssize_t)length, length);
+    node = create_node(pattern, op, 0, step * (Py_ssize_t)length, length, 0);
     if (!node)
         return NULL;
 

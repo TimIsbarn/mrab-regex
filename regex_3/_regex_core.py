@@ -1359,18 +1359,14 @@ def parse_code_conditional(source, info, optimistic=False):
     code = parse_code_text(source)
     source.expect("})")
 
-    yes_item = None
-    no_item = None
+    items = []
 
     def parse_items():
-        nonlocal yes_item, no_item
         saved_flags = info.flags
         try:
-            yes_item = parse_sequence(source, info)
-            if source.match("|"):
-                no_item = parse_sequence(source, info)
-            else:
-                no_item = Sequence()
+            items.append(parse_sequence(source, info))
+            while source.match("|"):
+                items.append(parse_sequence(source, info))
 
             source.expect(")")
         finally:
@@ -1378,13 +1374,15 @@ def parse_code_conditional(source, info, optimistic=False):
             source.ignore_space = bool(info.flags & VERBOSE)
 
     def no_conditional():
+        if len(items) == 0:
+            return Sequence()
         res = []
-        if not yes_item.is_empty():
-            res.append(yes_item)
-        if not no_item.is_empty():
-            # The no_item is wrapped in a (?(DEFINE)...) group (using index 0
-            # instead, in case DEFINE is a group name) to preserve references.
-            res.append(Conditional(info, "0", no_item, Sequence(),
+        if not items[0].is_empty():
+           res.append(items[0])
+        for item in items[1:]:
+            # The remaining items are wrapped in a (?(DEFINE)...) group
+            # (using index 0 instead, in case DEFINE is a group name).
+            res.append(Conditional(info, "0", item, Sequence(),
               source.pos, source.depth.copy()))
         return Sequence(res)
 
@@ -1398,15 +1396,8 @@ def parse_code_conditional(source, info, optimistic=False):
 
     parse_items()
 
-    if code_id < 0:
-        return no_conditional()
-
-    if yes_item.is_empty() and no_item.is_empty():
-        return Code(code_id, bool(info.flags & HALT_TIMER),
-          True, False, optimistic)
-
-    return CodeConditional(code_id, bool(info.flags & HALT_TIMER),
-      yes_item, no_item, optimistic)
+    return CodeConditional(code_id, bool(info.flags & HALT_TIMER), items,
+      optimistic)
 
 def parse_code_conditional_ref(source, info, optimistic=False):
     "Parses a code conditional using a reference."
@@ -1416,11 +1407,9 @@ def parse_code_conditional_ref(source, info, optimistic=False):
 
     saved_flags = info.flags
     try:
-        yes_item = parse_sequence(source, info)
-        if source.match("|"):
-            no_item = parse_sequence(source, info)
-        else:
-            no_item = Sequence()
+        items = [parse_sequence(source, info)]
+        while source.match("|"):
+            items.append(parse_sequence(source, info))
 
         source.expect(")")
     finally:
@@ -1428,13 +1417,15 @@ def parse_code_conditional_ref(source, info, optimistic=False):
         source.ignore_space = bool(info.flags & VERBOSE)
 
     def no_conditional():
+        if len(items) == 0:
+            return Sequence()
         res = []
-        if not yes_item.is_empty():
-            res.append(yes_item)
-        if not no_item.is_empty():
-            # The no_item is wrapped in a (?(DEFINE)...) group (using index 0
-            # instead, in case DEFINE is a group name) to preserve references.
-            res.append(Conditional(info, "0", no_item, Sequence(),
+        if not items[0].is_empty():
+           res.append(items[0])
+        for item in items[1:]:
+            # The remaining items are wrapped in a (?(DEFINE)...) group
+            # (using index 0 instead, in case DEFINE is a group name).
+            res.append(Conditional(info, "0", item, Sequence(),
               source.pos, source.depth.copy()))
         return Sequence(res)
 
@@ -1445,18 +1436,11 @@ def parse_code_conditional_ref(source, info, optimistic=False):
 
     code_id = info.code_index.get(name)
     if code_id is not None:
-        if code_id < 0:
-            return no_conditional()
+        return CodeConditional(code_id, bool(info.flags & HALT_TIMER), items,
+          optimistic)
 
-        if yes_item.is_empty() and no_item.is_empty():
-            return Code(code_id, bool(info.flags & HALT_TIMER),
-              True, False, optimistic)
-
-        return CodeConditional(code_id, bool(info.flags & HALT_TIMER),
-          yes_item, no_item, optimistic)
-
-    return CodeRefConditional(info, name, bool(info.flags & HALT_TIMER),
-      yes_item, no_item, optimistic, saved_pos, source.depth.copy())
+    return CodeRefConditional(info, name, bool(info.flags & HALT_TIMER), items,
+      optimistic, saved_pos, source.depth.copy())
 
 def evaluate_code(source, info, code):
     "Evaluates python code."
@@ -3231,62 +3215,57 @@ class CodeRefEval(RegexBase):
           self.start_pos, self.end_pos, self.depth)
 
 class CodeConditional(RegexBase):
-    def __init__(self, code_id, halt_timer, yes_item, no_item, optimistic):
+    def __init__(self, code_id, halt_timer, cases, optimistic):
         RegexBase.__init__(self)
         self.code_id = code_id
         self.halt_timer = halt_timer
-        self.yes_item = yes_item
-        self.no_item = no_item
+        self.cases = cases
         self.optimistic = optimistic
 
     def evaluate_code(self, source, info):
-        self.yes_item = self.yes_item.evaluate_code(source, info)
-        self.no_item = self.no_item.evaluate_code(source, info)
+        self.cases = [c.evaluate_code(source, info) for c in self.cases]
         return self
 
     def fix_groups(self, pattern, reverse, fuzzy):
-        self.yes_item.fix_groups(pattern, reverse, fuzzy)
-        self.no_item.fix_groups(pattern, reverse, fuzzy)
+        for c in self.cases:
+            c.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
-        yes_item = self.yes_item.optimise(info, reverse)
-        no_item = self.no_item.optimise(info, reverse)
+        # Don't flatten optimised items.
+        cases = [c.optimise(info, reverse) for c in self.cases]
 
-        return CodeConditional(self.code_id, self.halt_timer, yes_item,
-          no_item, self.optimistic)
+        return CodeConditional(self.code_id, self.halt_timer, cases,
+          self.optimistic)
 
     def pack_characters(self, info):
-        self.yes_item = self.yes_item.pack_characters(info)
-        self.no_item = self.no_item.pack_characters(info)
+        self.cases = [c.pack_characters(info) for c in self.cases]
         return self
 
     def remove_captures(self):
-        self.yes_item = self.yes_item.remove_captures()
-        self.no_item = self.no_item.remove_captures()
+        self.cases = [c.remove_captures() for c in self.cases]
+        return self
 
     def is_atomic(self):
-        return self.yes_item.is_atomic() and self.no_item.is_atomic()
+        return all(c.is_atomic() for c in self.cases)
 
     def can_be_affix(self):
-        return self.yes_item.can_be_affix() and self.no_item.can_be_affix()
+        return all(c.can_be_affix() for c in self.cases)
 
     def contains_group(self):
-        return self.yes_item.contains_group() or self.no_item.contains_group()
+        return any(c.contains_group() for c in self.cases)
 
     def get_firstset(self, reverse):
-        if self.optimistic:
-            return (self.yes_item.get_firstset(reverse) |
-              self.no_item.get_firstset(reverse))
+        if not self.optimistic:
+            raise _FirstSetError()
 
-        raise _FirstSetError()
+        return set([None])
 
     def _compile(self, reverse, fuzzy):
-        code = [(OP.EXEC_CODE_CONDITIONAL, self.code_id, int(self.halt_timer))]
-        code.extend(self.yes_item.compile(reverse, fuzzy))
-        add_code = self.no_item.compile(reverse, fuzzy)
-        if add_code:
+        code = [(OP.EXEC_CODE_CONDITIONAL, self.code_id, int(self.halt_timer),
+          len(self.cases))]
+        for c in self.cases:
             code.append((OP.NEXT, ))
-            code.extend(add_code)
+            code.extend(c.compile(reverse, fuzzy))
 
         code.append((OP.END, ))
 
@@ -3297,44 +3276,45 @@ class CodeConditional(RegexBase):
         opt = " OPTIMISTIC" if self.optimistic else ""
         print("{}CODE_CONDITIONAL {}{}{}".format(INDENT * indent,
           self.code_id, halt, opt))
-        self.yes_item.dump(indent + 1, reverse)
-        if not self.no_item.is_empty():
-            print("{}OR".format(INDENT * indent))
-            self.no_item.dump(indent + 1, reverse)
+        if self.cases:
+            self.cases[0].dump(indent + 1, reverse)
+            for c in self.cases[1:]:
+                print("{}OR".format(INDENT * indent))
+                c.dump(indent + 1, reverse)
+        else:
+            print("{}NONE".format(INDENT * (indent + 1)))
 
     def __eq__(self, other):
         return type(self) is type(other) and (self.code_id, self.halt_timer,
-          self.yes_item, self.no_item, self.optimistic) == (other.code_id,
-          other.halt_timer, other.yes_item, other.no_item, other.optimistic)
+          self.cases, self.optimistic) == (other.code_id, other.halt_timer,
+          other.cases, other.optimistic)
 
     def max_width(self):
-        return max(self.yes_item.max_width(), self.no_item.max_width())
+        return max(c.max_width() for c in self.cases)
 
     def get_required_string(self, reverse):
-        if self.optimistic:
-            return self.max_width(), None
+        if not self.optimistic:
+            raise _RequiredStringError()
 
-        raise _RequiredStringError()
+        return 0, None
 
 class CodeRefConditional(RegexBase):
-    def __init__(self, info, name, halt_timer, yes_item, no_item, optimistic,
+    def __init__(self, info, name, halt_timer, cases, optimistic,
       position, depth):
         RegexBase.__init__(self)
         self.info = info
         self.code_id = name
         self.halt_timer = halt_timer
-        self.yes_item = yes_item
-        self.no_item = no_item
+        self.cases = cases
         self.optimistic = optimistic
         self.position = position
         self.depth = depth
 
-        self._key = (self.__class__, self.code_id, self.halt_timer, self.yes_item,
-          self.no_item, self.optimistic)
+        self._key = (self.__class__, self.code_id, self.halt_timer, self.cases,
+          self.optimistic)
 
     def evaluate_code(self, source, info):
-        self.yes_item = self.yes_item.evaluate_code(source, info)
-        self.no_item = self.no_item.evaluate_code(source, info)
+        self.cases = [c.evaluate_code(source, info) for c in self.cases]
         return self
 
     def fix_groups(self, pattern, reverse, fuzzy):
@@ -3343,22 +3323,25 @@ class CodeRefConditional(RegexBase):
             raise error(f"unknown code reference: {name}", pattern,
               self.position, self.depth)
 
-        self.yes_item.fix_groups(pattern, reverse, fuzzy)
-        self.no_item.fix_groups(pattern, reverse, fuzzy)
+        for c in self.cases:
+            c.fix_groups(pattern, reverse, fuzzy)
 
     def optimise(self, info, reverse):
-        return CodeConditional(self.code_id, self.halt_timer, self.yes_item,
-          self.no_item, self.optimistic)
+        return CodeConditional(self.code_id, self.halt_timer, self.cases,
+          self.optimistic).optimise(info, reverse)
 
     def dump(self, indent, reverse):
         halt = " HALT_TIMER" if self.halt_timer else ""
         opt = " OPTIMISTIC" if self.optimistic else ""
         print("{}CODE_REF_CONDITIONAL {}{}{}".format(INDENT * indent,
-          self.name, halt, opt))
-        self.yes_item.dump(indent + 1, reverse)
-        if not self.no_item.is_empty():
-            print("{}OR".format(INDENT * indent))
-            self.no_item.dump(indent + 1, reverse)
+          self.code_id, halt, opt))
+        if self.cases:
+            self.cases[0].dump(indent + 1, reverse)
+            for c in self.cases[1:]:
+                print("{}OR".format(INDENT * indent))
+                c.dump(indent + 1, reverse)
+        else:
+            print("{}NONE".format(INDENT * (indent + 1)))
 
 class Conditional(RegexBase):
     def __init__(self, info, group, yes_item, no_item, position, depth):
