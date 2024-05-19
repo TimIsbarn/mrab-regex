@@ -141,8 +141,7 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_ERROR_TIMED_OUT -16 /* Matching has timed out. */
 #define RE_ERROR_LOCKED -17 /* Attempt to match on a locked state. */
 #define RE_ERROR_INVALID_STATE -18 /* Attempted to use an invalidated state object. */
-#define RE_ERROR_BAD_GLOBALS -19 /* Globals have to be a dict. */
-#define RE_ERROR_BAD_LOCALS -20 /* Locals has to support mapping. */
+#define RE_ERROR_INVALID_CODE_RESULT -19 /* Unexpected code result. */
 
 /* Node bitflags. */
 #define RE_POSITIVE_OP 0x1
@@ -217,9 +216,13 @@ typedef RE_UINT32 RE_STATUS_T;
 #define RE_FUZZY_VAL_DEL_COST (RE_FUZZY_VAL_COST_BASE + RE_FUZZY_DEL)
 #define RE_FUZZY_VAL_MAX_COST (RE_FUZZY_VAL_COST_BASE + RE_FUZZY_ERR)
 
-#define RE_CODE_NOTHING -1
-#define RE_CODE_ADVANCE -2
-#define RE_CODE_FAIL -3
+#define RE_CODE_NOTHING 0
+#define RE_CODE_ADVANCE 1
+#define RE_CODE_FAIL 2
+#define RE_CODE_BRANCH 3
+#define RE_CODE_NEXT 4
+#define RE_CODE_OPTIONAL 5
+#define RE_CODE_LAZY 6
 
 /* The maximum number of errors when trying to improve a fuzzy match. */
 #define RE_MAX_ERRORS 10
@@ -488,6 +491,8 @@ typedef struct RE_State {
     struct PatternObject* pattern; /* Parent PatternObject. */
     PyObject* globals; /* The global dict for embedded code. */
     PyObject* locals; /* The local dict for embedded code. */
+    PyObject** called_code; /* Array of callouts. */
+    PyObject* call_code;
     /* Info about the string being matched. */
     PyObject* string;
     Py_buffer view; /* View of the string if it's a buffer object. */
@@ -562,7 +567,6 @@ typedef struct RE_State {
     BOOL found_match; /* Whether a POSIX match has been found. */
     BOOL is_fuzzy; /* Whether the pattern is fuzzy. */
     BOOL run_code; /* Whether embedded code is permitted. */
-    BOOL backtracking; /* Whether the engine is backtracking. */
     BOOL locked; /* Whether the state is locked. */
 } RE_State;
 
@@ -570,7 +574,6 @@ typedef struct RE_State {
 typedef struct PatternObject {
     PyObject_HEAD
     PyObject* pattern; /* Pattern source (or None). */
-    PyObject* modified_pattern; /* Pattern after insertions (or None). */
     PyObject* module; /* The _regex module. */
     Py_ssize_t flags; /* Flags used when compiling pattern source. */
     PyObject* packed_code_list;
@@ -589,9 +592,13 @@ typedef struct PatternObject {
     PyObject* globals; /* The global dict for embedded code. */
     PyObject* locals; /* The local dict for embedded code. */
     PyObject* state; /* StateObject while executing code. */
-    size_t code_count;
+    size_t exec_code_count;
     PyObject** compiled_code; /* Code that's already compiled. */
     PyObject* codeindex;
+    size_t call_code_count;
+    PyObject* callindex;
+    PyObject* indexcall;
+    PyObject* call_code;
     BOOL code_dropped; /* Whether all code has been removed. */
     PyObject* named_lists;
     size_t named_lists_count;
@@ -655,12 +662,15 @@ typedef struct StateObject {
     PyObject_HEAD
     MatchObject* match;
     RE_State* state;
-    RE_STATUS_T status;
-    BOOL advance;
-    BOOL fail;
-    Py_ssize_t case_index;
-    Py_ssize_t max_index;
-    BOOL in_conditional;
+    BOOL reverse;
+    Py_ssize_t repetitions;
+    BOOL backtracking; /* Whether the engine is backtracking. */
+    BOOL in_conditional; /* Whether the code is used as a conditional. */
+    BOOL in_repeat; /* Whether the code is used as a repeat. */
+    int code_result;
+    Py_ssize_t number;
+    Py_ssize_t min_number;
+    Py_ssize_t max_number;
     BOOL valid;
 } StateObject;
 
@@ -2106,12 +2116,6 @@ Py_LOCAL_INLINE(void) set_error(int status, PyObject* object) {
     PyErr_Clear();
 
     switch (status) {
-    case RE_ERROR_BAD_GLOBALS:
-        PyErr_SetString(PyExc_ValueError, "globals not dict or None");
-        break;
-    case RE_ERROR_BAD_LOCALS:
-        PyErr_SetString(PyExc_ValueError, "locals not None or supports __getitem__");
-        break;
     case RE_ERROR_BAD_TIMEOUT:
         PyErr_SetString(PyExc_ValueError, "timeout not float or None");
         break;
@@ -2135,6 +2139,9 @@ Py_LOCAL_INLINE(void) set_error(int status, PyObject* object) {
         break;
     case RE_ERROR_INDEX:
         PyErr_SetString(PyExc_TypeError, "string indices must be integers");
+        break;
+    case RE_ERROR_INVALID_CODE_RESULT:
+        PyErr_SetString(PyExc_RuntimeError, "unexpected code result");
         break;
     case RE_ERROR_INVALID_GROUP_REF:
         if (!error_exception)
@@ -11643,7 +11650,9 @@ static PyTypeObject State_Type = {
 
 /* Returns a new StateObject. */
 Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state,
-  RE_STATUS_T status, BOOL in_conditional, Py_ssize_t max_index) {
+  BOOL reverse, Py_ssize_t min_number, Py_ssize_t max_number,
+  Py_ssize_t default_number, Py_ssize_t repetitions, BOOL backtracking,
+  BOOL in_conditional, BOOL in_repeat) {
     PyObject* match;
     StateObject* result;
 
@@ -11659,12 +11668,15 @@ Py_LOCAL_INLINE(StateObject*) new_state_object(RE_State* state,
 
     result->match = (MatchObject*)match;
     result->state = state;
-    result->status = status;
-    result->advance = FALSE;
-    result->fail = FALSE;
-    result->case_index = -1;
-    result->max_index = max_index;
+    result->reverse = reverse;
+    result->repetitions = repetitions;
+    result->backtracking = backtracking;
     result->in_conditional = in_conditional;
+    result->in_repeat = in_repeat;
+    result->code_result = RE_CODE_NOTHING;
+    result->number = default_number;
+    result->min_number = min_number;
+    result->max_number = max_number;
     result->valid = TRUE;
 
     return result;
@@ -11701,16 +11713,101 @@ Py_LOCAL_INLINE(PyObject*) get_code(RE_State* state, RE_CODE code_id) {
     return code_obj;
 }
 
+/* Calls a callout. */
+Py_LOCAL_INLINE(int) code_call(RE_State* state, size_t* code_result,
+  Py_ssize_t* code_number, BOOL reverse, RE_CODE callout_id, RE_CODE arg,
+  BOOL halt_timer, Py_ssize_t min_number, Py_ssize_t max_number,
+  Py_ssize_t number, Py_ssize_t repetitions, BOOL backtracking,
+  BOOL in_conditional, BOOL in_repeat) {
+    StateObject* state_object;
+    PyObject* result;
+    
+    TRACE(("    call code with id: %d\n", callout_id))
+
+    /* Re-acquire the GIL. */
+    acquire_GIL(state);
+
+    state_object = new_state_object(state, reverse, min_number, max_number,
+      number, repetitions, backtracking, in_conditional, in_repeat);
+    if (!state_object)
+        return RE_ERROR_MEMORY;
+
+    state->locked = TRUE;
+    state->execute_time = clock();
+
+    /* Call the code. */
+    result = PyObject_CallObject(state->called_code[callout_id],
+      Py_BuildValue("On", state_object, arg));
+
+    if (halt_timer)
+        state->skipped_time += clock() - state->execute_time;
+
+    *code_result = state_object->code_result;
+    if (code_number)
+        *code_number = state_object->number;
+
+#if defined(VERBOSE)
+    switch (state_object->code_result) {
+    case RE_CODE_NOTHING:
+        printf("        is NOTHING\n");
+        break;
+    case RE_CODE_ADVANCE:
+        printf("        is ADVANCE\n");
+        break;
+    case RE_CODE_FAIL:
+        printf("        is FAIL\n");
+        break;
+    case RE_CODE_BRANCH:
+        printf("        is BRANCH: %" PY_FORMAT_SIZE_T "d\n",
+          state_object->number);
+        break;
+    case RE_CODE_NEXT:
+        printf("        is NEXT\n");
+        break;
+    case RE_CODE_OPTIONAL:
+        printf("        is OPTIONAL\n");
+        break;
+    case RE_CODE_LAZY:
+        printf("        is LAZY\n");
+        break;
+    }
+#endif
+
+    /* StateObject should no longer be used. */
+    state_object->valid = FALSE;    
+    Py_DECREF(state_object->match);
+    state_object->match = NULL;
+    Py_DECREF(state_object);
+
+    state->locked = FALSE;
+
+    /* Invalid code, error has already been set. */
+    if (!result)
+        return RE_ERROR_CANCELLED;
+
+    Py_DECREF(result);
+
+    if (check_cancel(state))
+        return RE_ERROR_CANCELLED;
+
+    /* Release the GIL. */
+    release_GIL(state);
+
+    return RE_ERROR_SUCCESS;
+}
+
 /* Runs embedded code. */
-Py_LOCAL_INLINE(int) code_run(RE_State* state, Py_ssize_t* code_result,
-  RE_STATUS_T status, RE_CODE code_id, RE_CODE halt_timer, BOOL in_conditional,
-  Py_ssize_t max_index) {
+Py_LOCAL_INLINE(int) code_run(RE_State* state, size_t* code_result,
+  Py_ssize_t* code_number, BOOL reverse, RE_CODE code_id, RE_CODE halt_timer,
+  Py_ssize_t min_number, Py_ssize_t max_number, Py_ssize_t number,
+  Py_ssize_t repetitions, BOOL backtracking, BOOL in_conditional,
+  BOOL in_repeat) {
     StateObject* state_object;
     PyObject* dict;
     PyObject* code_obj;
     PyObject* result;
 
-    TRACE(("<<code>>\n"))
+    TRACE(("    run code with id: %d\n", code_id))
 
     /* Re-acquire the GIL. */
     acquire_GIL(state);
@@ -11719,7 +11816,8 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, Py_ssize_t* code_result,
     if (!code_obj)
         return RE_ERROR_MEMORY;
 
-    state_object = new_state_object(state, status, in_conditional, max_index);
+    state_object = new_state_object(state, reverse, min_number, max_number,
+      number, repetitions, backtracking, in_conditional, in_repeat);
     if (!state_object)
         return RE_ERROR_MEMORY;
 
@@ -11738,19 +11836,36 @@ Py_LOCAL_INLINE(int) code_run(RE_State* state, Py_ssize_t* code_result,
     if (halt_timer)
         state->skipped_time += clock() - state->execute_time;
 
-    if (state_object->case_index >= 0) {
-        TRACE(("    code_result: %d\n", state_object->case_index))
-        *code_result = state_object->case_index;
-    } else if (state_object->advance) {
-        TRACE(("    code_result: ADVANCE\n"))
-        *code_result = RE_CODE_ADVANCE;
-    } else if (state_object->fail) {
-        TRACE(("    code_result: FAIL\n"))
-        *code_result = RE_CODE_FAIL;
-    } else {
-        TRACE(("    code_result: NOTHING\n"))
-        *code_result = RE_CODE_NOTHING;
+    *code_result = state_object->code_result;
+    if (code_number)
+        *code_number = state_object->number;
+
+#if defined(VERBOSE)
+    switch (state_object->code_result) {
+    case RE_CODE_NOTHING:
+        printf("        is NOTHING\n");
+        break;
+    case RE_CODE_ADVANCE:
+        printf("        is ADVANCE\n");
+        break;
+    case RE_CODE_FAIL:
+        printf("        is FAIL\n");
+        break;
+    case RE_CODE_BRANCH:
+        printf("        is BRANCH: %" PY_FORMAT_SIZE_T "d\n",
+          state_object->number);
+        break;
+    case RE_CODE_NEXT:
+        printf("        is NEXT\n");
+        break;
+    case RE_CODE_OPTIONAL:
+        printf("        is OPTIONAL\n");
+        break;
+    case RE_CODE_LAZY:
+        printf("        is LAZY\n");
+        break;
     }
+#endif
 
     /* StateObject should no longer be used. */
     state_object->valid = FALSE;    
@@ -12278,6 +12393,2786 @@ advance:
             } else
                 goto backtrack;
             break;
+        case RE_OP_CODE_CALL: /* Code call. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_call(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], FALSE, 0, 0,
+              -1, -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+            
+            if (!push_pointer(state, &state->bstack, node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node CODE_EXEC */
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_CALL_HLT: /* Code call, halt timer. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_call(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], TRUE, 0, 0,
+              -1, -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+            
+            if (!push_pointer(state, &state->bstack, node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC_HLT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node CODE_EXEC_HLT */
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_CALL_ADV: /* Code call on advancing. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_call(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], FALSE, 0, 0,
+              -1, -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_CALL_ADV_HLT: /* Code call on advancing, halt timer. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_call(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], TRUE, 0, 0,
+              -1, -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_CALL_REV: /* Code call on backtracking. */
+        case RE_OP_CODE_CALL_REV_HLT: /* Code call on backtracking, halt timer. */
+        case RE_OP_CODE_EXEC_REV: /* Code execute on backtracking. */
+        case RE_OP_CODE_EXEC_REV_HLT: /* Code execute on backtracking, halt timer. */
+        {
+            /* args: code_id | callout_id arg. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                if (!push_pointer(state, &state->bstack, node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+    
+                /* bstack: code_node op */
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_EXEC: /* Code execute. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_run(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], FALSE, 0, 0, -1,
+              -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            if (!push_pointer(state, &state->bstack, node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node CODE_EXEC */
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_EXEC_HLT: /* Code execute, halt timer. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_run(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], TRUE, 0, 0, -1,
+              -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+            
+            if (!push_pointer(state, &state->bstack, node))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC_HLT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: code_node CODE_EXEC_HLT */
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_EXEC_ADV: /* Code execute on advancing. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_run(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], FALSE, 0, 0, -1,
+              -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_EXEC_ADV_HLT: /* Code execute on advancing, halt timer. */
+        {
+            int status;
+            size_t code_result;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+            
+            status = code_run(state, &code_result, NULL, node->status &
+              RE_STATUS_REVERSE, node->values[0], TRUE, 0, 0, -1,
+              -1, FALSE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            node = node->next_1.node;
+            break;
+        }
+        case RE_OP_CODE_CALL_CONDITIONAL: /* Code call conditional. */
+        {
+            int status;
+            size_t code_result;
+            Py_ssize_t code_number;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_call(state, &code_result, &code_number, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], FALSE, 0,
+              (Py_ssize_t)node->node_count, 0, -1, FALSE, TRUE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                node = node->next_1.node;
+                break;
+            case RE_CODE_BRANCH:
+                node = node->nodes[code_number].node;
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_CALL_CONDITIONAL_HLT: /* Code call conditional, halt timer. */
+        {
+            int status;
+            size_t code_result;
+            Py_ssize_t code_number;
+
+            /* args: callout_id, arg. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_call(state, &code_result, &code_number, node->status &
+              RE_STATUS_REVERSE, node->values[0], node->values[1], TRUE, 0,
+              (Py_ssize_t)node->node_count, 0, -1, FALSE, TRUE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                node = node->next_1.node;
+                break;
+            case RE_CODE_BRANCH:
+                node = node->nodes[code_number].node;
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_EXEC_CONDITIONAL: /* Code execute conditional. */
+        {
+            int status;
+            size_t code_result;
+            Py_ssize_t code_number;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_run(state, &code_result, &code_number, node->status &
+              RE_STATUS_REVERSE, node->values[0], FALSE, 0,
+              (Py_ssize_t)node->node_count, 0, -1, FALSE, TRUE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                node = node->next_1.node;
+                break;
+            case RE_CODE_BRANCH:
+                node = node->nodes[code_number].node;
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_EXEC_CONDITIONAL_HLT: /* Code execute conditional, halt timer. */
+        {
+            int status;
+            size_t code_result;
+            Py_ssize_t code_number;
+
+            /* args: code_id. */
+            TRACE(("%s %d\n", re_op_text[node->op], node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped) {
+                node = node->next_1.node;
+                break;
+            }
+
+            status = code_run(state, &code_result, &code_number, node->status &
+              RE_STATUS_REVERSE, node->values[0], TRUE, 0,
+              (Py_ssize_t)node->node_count, 0, -1, FALSE, TRUE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+                node = node->next_1.node;
+                break;
+            case RE_CODE_BRANCH:
+                node = node->nodes[code_number].node;
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_CALL_END_REPEAT: /* End of a code call repeat. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL changed;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_BodyEndStateData data_be;
+            /* args: index, callout_id, forward, arg. */
+            TRACE(("%s %d %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1], node->values[3]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* The body has matched successfully at this position. */
+            if (!guard_repeat(state, index, rp_data->start, RE_STATUS_BODY,
+              FALSE))
+                return RE_ERROR_MEMORY;
+
+            ++rp_data->count;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_call(state, &code_result, &code_number,
+                  node->values[2], node->values[1], node->values[3], FALSE, 0,
+                  -1, 0, rp_data->count, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                --rp_data->count;
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            /* Have we advanced through the text or has a capture group change?
+             */
+            changed = rp_data->capture_change != state->capture_change ||
+              state->text_pos != rp_data->start;
+
+            /* Additional checks are needed if there's fuzzy matching. */
+            if (changed && state->is_fuzzy)
+                changed = !(node->step == 1 ? state->text_pos >=
+                  state->slice_end : state->text_pos <= state->slice_start);
+
+            TRACE(("    code_id is %u, count is %" PY_FORMAT_SIZE_T "u\n",
+              node->values[1], rp_data->count))
+
+            /* Could the body or tail match? */
+            try_body = changed && code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0) {
+                    if (body_status == RE_ERROR_PARTIAL && at_end(state) &&
+                      code_result != RE_CODE_LAZY)
+                        body_status = RE_ERROR_FAILURE;
+                    else
+                        return body_status;
+                }
+
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+
+            try_tail = changed && !is_repeat_guarded(state, index,
+              state->text_pos, RE_STATUS_TAIL);
+            if (try_tail) {
+                tail_status = try_match(state, &node->nonstring.next_2,
+                  state->text_pos, &next_tail_position);
+                if (tail_status < 0)
+                    return tail_status;
+
+                if (tail_status == RE_ERROR_FAILURE)
+                    try_tail = FALSE;
+            } else
+                tail_status = RE_ERROR_FAILURE;
+
+            if (!try_body && !try_tail) {
+                /* Neither the body nor the tail could match. */
+                --rp_data->count;
+                goto backtrack;
+            }
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            /* Record info in case we backtrack into the body. */
+            data_be.count = rp_data->count - 1;
+            data_be.start = rp_data->start;
+            data_be.capture_change = rp_data->capture_change;
+            data_be.index = index;
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_be,
+              sizeof(data_be)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_BODY_END))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index BODY_END */
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_CALL_END_REPEAT_HLT: /* End of a code call repeat, halt timer. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL changed;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_BodyEndStateData data_be;
+            /* args: index, callout_id, forward, arg. */
+            TRACE(("%s %d %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1], node->values[3]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* The body has matched successfully at this position. */
+            if (!guard_repeat(state, index, rp_data->start, RE_STATUS_BODY,
+              FALSE))
+                return RE_ERROR_MEMORY;
+
+            ++rp_data->count;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_call(state, &code_result, &code_number,
+                  node->values[2], node->values[1], node->values[3], TRUE, 0,
+                  -1, 0, rp_data->count, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                --rp_data->count;
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            /* Have we advanced through the text or has a capture group change?
+             */
+            changed = rp_data->capture_change != state->capture_change ||
+              state->text_pos != rp_data->start;
+
+            /* Additional checks are needed if there's fuzzy matching. */
+            if (changed && state->is_fuzzy)
+                changed = !(node->step == 1 ? state->text_pos >=
+                  state->slice_end : state->text_pos <= state->slice_start);
+
+            TRACE(("    code_id is %u, count is %" PY_FORMAT_SIZE_T "u\n",
+              node->values[1], rp_data->count))
+
+            /* Could the body or tail match? */
+            try_body = changed && code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0) {
+                    if (body_status == RE_ERROR_PARTIAL && at_end(state) &&
+                      code_result != RE_CODE_LAZY)
+                        body_status = RE_ERROR_FAILURE;
+                    else
+                        return body_status;
+                }
+
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+
+            try_tail = changed && !is_repeat_guarded(state, index,
+              state->text_pos, RE_STATUS_TAIL);
+            if (try_tail) {
+                tail_status = try_match(state, &node->nonstring.next_2,
+                  state->text_pos, &next_tail_position);
+                if (tail_status < 0)
+                    return tail_status;
+
+                if (tail_status == RE_ERROR_FAILURE)
+                    try_tail = FALSE;
+            } else
+                tail_status = RE_ERROR_FAILURE;
+
+            if (!try_body && !try_tail) {
+                /* Neither the body nor the tail could match. */
+                --rp_data->count;
+                goto backtrack;
+            }
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            /* Record info in case we backtrack into the body. */
+            data_be.count = rp_data->count - 1;
+            data_be.start = rp_data->start;
+            data_be.capture_change = rp_data->capture_change;
+            data_be.index = index;
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_be,
+              sizeof(data_be)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_BODY_END))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index BODY_END */
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_EXEC_END_REPEAT: /* End of a code execute repeat. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL changed;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_BodyEndStateData data_be;
+            /* args: index, code_id, forward. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* The body has matched successfully at this position. */
+            if (!guard_repeat(state, index, rp_data->start, RE_STATUS_BODY,
+              FALSE))
+                return RE_ERROR_MEMORY;
+
+            ++rp_data->count;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_run(state, &code_result, &code_number,
+                  node->values[2], node->values[1], FALSE, 0, -1, 0,
+                  rp_data->count, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                --rp_data->count;
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            /* Have we advanced through the text or has a capture group change?
+             */
+            changed = rp_data->capture_change != state->capture_change ||
+              state->text_pos != rp_data->start;
+
+            /* Additional checks are needed if there's fuzzy matching. */
+            if (changed && state->is_fuzzy)
+                changed = !(node->step == 1 ? state->text_pos >=
+                  state->slice_end : state->text_pos <= state->slice_start);
+
+            TRACE(("    code_id is %u, count is %" PY_FORMAT_SIZE_T "u\n",
+              node->values[1], rp_data->count))
+
+            /* Could the body or tail match? */
+            try_body = changed && code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0) {
+                    if (body_status == RE_ERROR_PARTIAL && at_end(state) &&
+                      code_result != RE_CODE_LAZY)
+                        body_status = RE_ERROR_FAILURE;
+                    else
+                        return body_status;
+                }
+
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+
+            try_tail = changed && !is_repeat_guarded(state, index,
+              state->text_pos, RE_STATUS_TAIL);
+            if (try_tail) {
+                tail_status = try_match(state, &node->nonstring.next_2,
+                  state->text_pos, &next_tail_position);
+                if (tail_status < 0)
+                    return tail_status;
+
+                if (tail_status == RE_ERROR_FAILURE)
+                    try_tail = FALSE;
+            } else
+                tail_status = RE_ERROR_FAILURE;
+
+            if (!try_body && !try_tail) {
+                /* Neither the body nor the tail could match. */
+                --rp_data->count;
+                goto backtrack;
+            }
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            /* Record info in case we backtrack into the body. */
+            data_be.count = rp_data->count - 1;
+            data_be.start = rp_data->start;
+            data_be.capture_change = rp_data->capture_change;
+            data_be.index = index;
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_be,
+              sizeof(data_be)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_BODY_END))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index BODY_END */
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_EXEC_END_REPEAT_HLT: /* End of a code execute repeat, halt timer. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL changed;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_BodyEndStateData data_be;
+            /* args: index, code_id, forward. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* The body has matched successfully at this position. */
+            if (!guard_repeat(state, index, rp_data->start, RE_STATUS_BODY,
+              FALSE))
+                return RE_ERROR_MEMORY;
+
+            ++rp_data->count;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_run(state, &code_result, &code_number,
+                  node->values[2], node->values[1], TRUE, 0, -1, 0,
+                  rp_data->count, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                --rp_data->count;
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            /* Have we advanced through the text or has a capture group change?
+             */
+            changed = rp_data->capture_change != state->capture_change ||
+              state->text_pos != rp_data->start;
+
+            /* Additional checks are needed if there's fuzzy matching. */
+            if (changed && state->is_fuzzy)
+                changed = !(node->step == 1 ? state->text_pos >=
+                  state->slice_end : state->text_pos <= state->slice_start);
+
+            TRACE(("    code_id is %u, count is %" PY_FORMAT_SIZE_T "u\n",
+              node->values[1], rp_data->count))
+
+            /* Could the body or tail match? */
+            try_body = changed && code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0) {
+                    if (body_status == RE_ERROR_PARTIAL && at_end(state) &&
+                      code_result != RE_CODE_LAZY)
+                        body_status = RE_ERROR_FAILURE;
+                    else
+                        return body_status;
+                }
+
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+
+            try_tail = changed && !is_repeat_guarded(state, index,
+              state->text_pos, RE_STATUS_TAIL);
+            if (try_tail) {
+                tail_status = try_match(state, &node->nonstring.next_2,
+                  state->text_pos, &next_tail_position);
+                if (tail_status < 0)
+                    return tail_status;
+
+                if (tail_status == RE_ERROR_FAILURE)
+                    try_tail = FALSE;
+            } else
+                tail_status = RE_ERROR_FAILURE;
+
+            if (!try_body && !try_tail) {
+                /* Neither the body nor the tail could match. */
+                --rp_data->count;
+                goto backtrack;
+            }
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            /* Record info in case we backtrack into the body. */
+            data_be.count = rp_data->count - 1;
+            data_be.start = rp_data->start;
+            data_be.capture_change = rp_data->capture_change;
+            data_be.index = index;
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_be,
+              sizeof(data_be)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_BODY_END))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index BODY_END */
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_CALL_REPEAT: /* Code call repeat. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_RepeatStateData data_r;
+            /* args: index, callout_id, forward, arg. */
+            TRACE(("%s %d %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1], node->values[3]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* We might need to backtrack into the head, so save the current
+             * repeat.
+             */
+            data_r.count = rp_data->count;
+            data_r.start = rp_data->start;
+            data_r.capture_change = rp_data->capture_change;
+            data_r.index = index;
+            data_r.text_pos = state->text_pos;
+
+            /* Initialise the new repeat. */
+            rp_data->count = 0;
+            rp_data->start = state->text_pos;
+            rp_data->capture_change = state->capture_change;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_call(state, &code_result, &code_number,
+                  node->values[2], node->values[1], node->values[3], FALSE, 0,
+                  -1, 0, 0, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_r,
+              sizeof(data_r)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_CALL_REPEAT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index text_pos
+             * CODE_CALL_REPEAT
+             */
+
+            /* Could the body or tail match? */
+#if defined(VERBOSE)
+            printf("    is_repeat_guarded(..., RE_STATUS_BODY) returns %d\n",
+              is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY));
+#endif
+
+            try_body = code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0)
+                    return body_status;
+                
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+            
+            tail_status = try_match(state, &node->nonstring.next_2,
+              state->text_pos, &next_tail_position);
+            if (tail_status < 0)
+                return tail_status;
+            
+            try_tail = tail_status != RE_ERROR_FAILURE;
+            
+            if (!try_body && !try_tail)
+                /* Neither the body nor the tail could match. */
+                goto backtrack;
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_CALL_REPEAT_HLT: /* Code call repeat, halt timer. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_RepeatStateData data_r;
+            /* args: index, callout_id, forward, arg. */
+            TRACE(("%s %d %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1], node->values[3]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* We might need to backtrack into the head, so save the current
+             * repeat.
+             */
+            data_r.count = rp_data->count;
+            data_r.start = rp_data->start;
+            data_r.capture_change = rp_data->capture_change;
+            data_r.index = index;
+            data_r.text_pos = state->text_pos;
+
+            /* Initialise the new repeat. */
+            rp_data->count = 0;
+            rp_data->start = state->text_pos;
+            rp_data->capture_change = state->capture_change;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_call(state, &code_result, &code_number,
+                  node->values[2], node->values[1], node->values[3], TRUE, 0,
+                  -1, 0, 0, FALSE, FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_r,
+              sizeof(data_r)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_CALL_REPEAT_HLT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index text_pos
+             * CODE_CALL_REPEAT_HLT
+             */
+
+            /* Could the body or tail match? */
+#if defined(VERBOSE)
+            printf("    is_repeat_guarded(..., RE_STATUS_BODY) returns %d\n",
+              is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY));
+#endif
+
+            try_body = code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0)
+                    return body_status;
+                
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+            
+            tail_status = try_match(state, &node->nonstring.next_2,
+              state->text_pos, &next_tail_position);
+            if (tail_status < 0)
+                return tail_status;
+            
+            try_tail = tail_status != RE_ERROR_FAILURE;
+            
+            if (!try_body && !try_tail)
+                /* Neither the body nor the tail could match. */
+                goto backtrack;
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
+        case RE_OP_CODE_EXEC_REPEAT: /* Code execute repeat. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_RepeatStateData data_r;
+            /* args: index, code_id, forward. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* We might need to backtrack into the head, so save the current
+             * repeat.
+             */
+            data_r.count = rp_data->count;
+            data_r.start = rp_data->start;
+            data_r.capture_change = rp_data->capture_change;
+            data_r.index = index;
+            data_r.text_pos = state->text_pos;
+
+            /* Initialise the new repeat. */
+            rp_data->count = 0;
+            rp_data->start = state->text_pos;
+            rp_data->capture_change = state->capture_change;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_run(state, &code_result, &code_number,
+                  node->values[2], node->values[1], FALSE, 0, -1, 0, 0, FALSE,
+                  FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+            
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_r,
+              sizeof(data_r)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC_REPEAT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index text_pos
+             * CODE_EXEC_REPEAT
+             */
+
+            /* Could the body or tail match? */
+#if defined(VERBOSE)
+            printf("    is_repeat_guarded(..., RE_STATUS_BODY) returns %d\n",
+              is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY));
+#endif
+
+            try_body = code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0)
+                    return body_status;
+                
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+            
+            tail_status = try_match(state, &node->nonstring.next_2,
+              state->text_pos, &next_tail_position);
+            if (tail_status < 0)
+                return tail_status;
+            
+            try_tail = tail_status != RE_ERROR_FAILURE;
+            
+            if (!try_body && !try_tail)
+                /* Neither the body nor the tail could match. */
+                goto backtrack;
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+            break;
+        }
+        case RE_OP_CODE_EXEC_REPEAT_HLT: /* Code execute repeat, halt timer. */
+        {
+            RE_CODE index;
+            int status;
+            RE_RepeatData* rp_data;
+            size_t code_result;
+            Py_ssize_t code_number;
+            BOOL try_body;
+            int body_status;
+            RE_Position next_body_position;
+            BOOL try_tail;
+            int tail_status;
+            RE_Position next_tail_position;
+            RE_RepeatStateData data_r;
+            /* args: index, code_id, forward. */
+            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
+              node->values[1]))
+
+            /* Repeat indexes are 0-based. */
+            index = node->values[0];
+            rp_data = &state->repeats[index];
+
+            /* We might need to backtrack into the head, so save the current
+             * repeat.
+             */
+            data_r.count = rp_data->count;
+            data_r.start = rp_data->start;
+            data_r.capture_change = rp_data->capture_change;
+            data_r.index = index;
+            data_r.text_pos = state->text_pos;
+
+            /* Initialise the new repeat. */
+            rp_data->count = 0;
+            rp_data->start = state->text_pos;
+            rp_data->capture_change = state->capture_change;
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (state->run_code && !pattern->code_dropped) {
+                status = code_run(state, &code_result, &code_number,
+                  node->values[2], node->values[1], TRUE, 0, -1, 0, 0, FALSE,
+                  FALSE, TRUE);
+
+                if (status != RE_ERROR_SUCCESS)
+                    return status;
+            } else {
+                code_result = RE_CODE_ADVANCE;
+                code_number = 0;
+            }
+            
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_LAZY:
+            case RE_CODE_NEXT:
+            case RE_CODE_NOTHING:
+            case RE_CODE_OPTIONAL:
+                break;
+            case RE_CODE_FAIL:
+                goto backtrack;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            if (!ByteStack_push_block(state, &state->bstack, (void*)&data_r,
+              sizeof(data_r)))
+                return RE_ERROR_MEMORY;
+            if (!push_uint8(state, &state->bstack, RE_OP_CODE_EXEC_REPEAT_HLT))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: count start capture_change index text_pos
+             * CODE_EXEC_REPEAT_HLT
+             */
+
+            /* Could the body or tail match? */
+#if defined(VERBOSE)
+            printf("    is_repeat_guarded(..., RE_STATUS_BODY) returns %d\n",
+              is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY));
+#endif
+
+            try_body = code_result != RE_CODE_ADVANCE &&
+              !is_repeat_guarded(state, index, state->text_pos,
+              RE_STATUS_BODY);
+            if (try_body) {
+                body_status = try_match(state, &node->next_1, state->text_pos,
+                  &next_body_position);
+                if (body_status < 0)
+                    return body_status;
+                
+                if (body_status == RE_ERROR_FAILURE)
+                    try_body = FALSE;
+            } else
+                body_status = RE_ERROR_FAILURE;
+            
+            tail_status = try_match(state, &node->nonstring.next_2,
+              state->text_pos, &next_tail_position);
+            if (tail_status < 0)
+                return tail_status;
+            
+            try_tail = tail_status != RE_ERROR_FAILURE;
+            
+            if (!try_body && !try_tail)
+                /* Neither the body nor the tail could match. */
+                goto backtrack;
+
+            if (body_status < 0 || (body_status == 0 && tail_status < 0))
+                return RE_ERROR_PARTIAL;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+            case RE_CODE_NOTHING:
+            {
+                if (try_tail) {
+                    /* A match of the tail is required. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_LAZY:
+            {
+                if (try_tail) {
+                    if (try_body) {
+                        /* Both the body and the tail could match, but the tail
+                         * takes precedence. If the tail fails to match then we
+                         * want to try the body before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the body. */
+                        data_mbt.position = next_body_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_BODY))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_BODY
+                         */
+                    }
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                } else {
+                    /* Only the body could match. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                }
+                break;
+            }
+            case RE_CODE_NEXT:
+            {
+                if (try_body) {
+                    /* A match of the body is required. */
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else
+                    goto backtrack;
+                break;
+            }
+            case RE_CODE_OPTIONAL:
+            {
+                if (try_body) {
+                    if (try_tail) {
+                        /* Both the body and the tail could match, but the body
+                         * takes precedence. If the body fails to match then we
+                         * want to try the tail before backtracking further.
+                         */
+                        RE_MatchBodyTailStateData data_mbt;
+    
+                        /* Record backtracking info for matching the tail. */
+                        data_mbt.position = next_tail_position;
+                        data_mbt.count = rp_data->count;
+                        data_mbt.start = rp_data->start;
+                        data_mbt.capture_change = rp_data->capture_change;
+                        data_mbt.index = index;
+                        data_mbt.text_pos = state->text_pos;
+    
+                        if (!ByteStack_push_block(state, &state->bstack,
+                          (void*)&data_mbt, sizeof(data_mbt)))
+                            return RE_ERROR_MEMORY;
+                        if (!push_uint8(state, &state->bstack, RE_OP_MATCH_TAIL))
+                            return RE_ERROR_MEMORY;
+    
+                        /* bstack: position count start capture_change index
+                         * text_pos MATCH_TAIL
+                         */
+                    }
+    
+                    /* Record backtracking info in case the body fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_BODY_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos BODY_START */
+    
+                    /* Advance into the body. */
+                    node = next_body_position.node;
+                    state->text_pos = next_body_position.text_pos;
+                } else {
+                    /* Only the tail could match. */
+    
+                    /* Record backtracking info in case the tail fails to match. */
+                    if (!push_code(state, &state->bstack, index))
+                        return RE_ERROR_MEMORY;
+                    if (!push_ssize(state, &state->bstack, state->text_pos))
+                        return RE_ERROR_MEMORY;
+                    if (!push_uint8(state, &state->bstack, RE_OP_TAIL_START))
+                        return RE_ERROR_MEMORY;
+    
+                    /* bstack: index text_pos TAIL_START */
+    
+                    /* Advance into the tail. */
+                    node = next_tail_position.node;
+                    state->text_pos = next_tail_position.text_pos;
+                }
+                break;
+            }
+            }
+            break;
+        }
         case RE_OP_CONDITIONAL: /* Start of a conditional subpattern. */
         {
             RE_LookaroundStateData data_l;
@@ -13195,86 +16090,6 @@ advance:
             } else
                 goto backtrack;
             break;
-        case RE_OP_EXEC_CODE:
-        case RE_OP_EXEC_CODE_ADV:
-        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
-        {
-            int status;
-            Py_ssize_t code_result;
-
-            /* args: code_id, halt_timer. */
-            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
-              node->values[1]))
-
-            /* Skip code when CODE is not set or code has been dropped. */
-            if (!state->run_code || pattern->code_dropped) {
-                node = node->next_1.node;
-                break;
-            }
-
-            if (node->op != RE_OP_EXEC_CODE_REV) {
-                state->backtracking = FALSE;
-                status = code_run(state, &code_result, node->status,
-                  node->values[0], node->values[1], FALSE, 0);
-
-                if (status != RE_ERROR_SUCCESS)
-                    return status;
-
-                switch (code_result) {
-                case RE_CODE_FAIL:
-                    goto backtrack;
-                }
-            }
-
-            if (node->op != RE_OP_EXEC_CODE_ADV) {
-                if (!push_pointer(state, &state->bstack, node))
-                    return RE_ERROR_MEMORY;
-                if (!push_uint8(state, &state->bstack, node->op))
-                    return RE_ERROR_MEMORY;
-
-                /* bstack: code_node op */
-            }
-
-            node = node->next_1.node;
-            break;
-        }
-        case RE_OP_EXEC_CODE_CONDITIONAL: /* Embedded python code conditional. */
-        {
-            int status;
-            Py_ssize_t code_result;
-
-            /* args: code_id, halt_timer. */
-            TRACE(("%s %d %d\n", re_op_text[node->op], node->values[0],
-              node->values[1]))
-
-            /* Skip code when CODE is not set or code has been dropped. */
-            if (!state->run_code || pattern->code_dropped) {
-                node = node->next_1.node;
-                break;
-            }
-
-            state->backtracking = FALSE;
-            status = code_run(state, &code_result, node->status,
-              node->values[0], node->values[1], TRUE,
-              (Py_ssize_t)node->node_count);
-
-            if (status != RE_ERROR_SUCCESS)
-                return status;
-
-            switch (code_result) {
-            case RE_CODE_ADVANCE:
-            case RE_CODE_NOTHING:
-                node = node->next_1.node;
-                break;
-            case RE_CODE_FAIL:
-                goto backtrack;
-            default:
-                node = node->nodes[code_result].node;
-                break;
-            }
-
-            break;
-        }
         case RE_OP_FAILURE: /* Failure. */
             goto backtrack;
         case RE_OP_FUZZY: /* Fuzzy matching. */
@@ -13353,8 +16168,7 @@ advance:
             if (!push_uint8(state, &state->bstack, RE_OP_GREEDY_REPEAT))
                 return RE_ERROR_MEMORY;
 
-            /* bstack: count start capture_change index text_pos GREEDY_REPEAT
-             */
+            /* bstack: count start capture_change index text_pos GREEDY_REPEAT */
 
             /* Initialise the new repeat. */
             rp_data->count = 0;
@@ -15519,6 +18333,235 @@ backtrack:
             if (!drop_pointer(state, &state->sstack))
                 return RE_ERROR_MEMORY;
             break;
+        case RE_OP_CODE_CALL: /* Code call. */
+        case RE_OP_CODE_CALL_REV: /* Code call on backtracking. */
+        {
+            RE_Node* code_node;
+            int status;
+            size_t code_result;
+
+            /* bstack: callout_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d\n", re_op_text[op], code_node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped)
+                break;
+            
+            status = code_call(state, &code_result, NULL, code_node->status &
+              RE_STATUS_REVERSE, code_node->values[0], code_node->values[1],
+              FALSE, 0, 0, -1, -1, TRUE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+                if (!push_pointer(state, &state->bstack, code_node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+
+                node = code_node->next_1.node;
+                goto advance;
+            case RE_CODE_FAIL:
+            case RE_CODE_NOTHING:
+                break;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_CALL_HLT: /* Code call, halt timer. */
+        case RE_OP_CODE_CALL_REV_HLT: /* Code call on backtracking, halt timer. */
+        {
+            RE_Node* code_node;
+            int status;
+            size_t code_result;
+
+            /* bstack: callout_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d\n", re_op_text[op], code_node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped)
+                break;
+            
+            status = code_call(state, &code_result, NULL, code_node->status &
+              RE_STATUS_REVERSE, code_node->values[0], code_node->values[1],
+              TRUE, 0, 0, -1, -1, TRUE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+                if (!push_pointer(state, &state->bstack, code_node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+
+                node = code_node->next_1.node;
+                goto advance;
+            case RE_CODE_FAIL:
+            case RE_CODE_NOTHING:
+                break;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_EXEC: /* Code execute. */
+        case RE_OP_CODE_EXEC_HLT: /* Code execute, halt timer. */
+        {
+            RE_Node* code_node;
+            int status;
+            size_t code_result;
+
+            /* bstack: code_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d\n", re_op_text[op], code_node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped)
+                break;
+            
+            status = code_run(state, &code_result, NULL, code_node->status &
+              RE_STATUS_REVERSE, code_node->values[0], FALSE, 0, 0, -1, -1,
+              TRUE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+                if (!push_pointer(state, &state->bstack, code_node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+
+                node = code_node->next_1.node;
+                goto advance;
+            case RE_CODE_FAIL:
+            case RE_CODE_NOTHING:
+                break;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_EXEC_REV: /* Code execute on backtracking. */
+        case RE_OP_CODE_EXEC_REV_HLT: /* Code execute on backtracking, halt timer. */
+        {
+            RE_Node* code_node;
+            int status;
+            size_t code_result;
+
+            /* bstack: code_node */
+
+            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
+                return RE_ERROR_MEMORY;
+
+            /* bstack: - */
+
+            TRACE(("%s %d\n", re_op_text[op], code_node->values[0]))
+
+            /* Skip code when CODE is not set or code has been dropped. */
+            if (!state->run_code || pattern->code_dropped)
+                break;
+            
+            status = code_run(state, &code_result, NULL, code_node->status &
+              RE_STATUS_REVERSE, code_node->values[0], TRUE, 0, 0, -1, -1,
+              TRUE, FALSE, FALSE);
+
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+
+            switch (code_result) {
+            case RE_CODE_ADVANCE:
+                if (!push_pointer(state, &state->bstack, code_node))
+                    return RE_ERROR_MEMORY;
+                if (!push_uint8(state, &state->bstack, node->op))
+                    return RE_ERROR_MEMORY;
+
+                /* bstack: code_node op */
+
+                node = code_node->next_1.node;
+                goto advance;
+            case RE_CODE_FAIL:
+            case RE_CODE_NOTHING:
+                break;
+            default:
+                return RE_ERROR_INVALID_CODE_RESULT;
+            }
+
+            break;
+        }
+        case RE_OP_CODE_CALL_REPEAT: /* Code call repeat. */
+        case RE_OP_CODE_CALL_REPEAT_HLT: /* Code call repeat, halt timer. */
+        case RE_OP_CODE_EXEC_REPEAT: /* Code execute repeat. */
+        case RE_OP_CODE_EXEC_REPEAT_HLT: /* Code execute repeat, halt timer. */
+        case RE_OP_GREEDY_REPEAT: /* Greedy repeat. */
+        case RE_OP_LAZY_REPEAT: /* Lazy repeat. */
+        {
+            RE_RepeatStateData data_r;
+            Py_ssize_t text_pos;
+            RE_CODE index;
+            size_t capture_change;
+            Py_ssize_t start;
+            size_t count;
+            RE_RepeatData* rp_data;
+            TRACE(("%s\n", re_op_text[op]))
+
+            /* bstack: count start capture_change index text_pos */
+
+            if (!ByteStack_pop_block(state, &state->bstack, (void*)&data_r,
+              sizeof(data_r)))
+                return RE_ERROR_MEMORY;
+
+            text_pos = data_r.text_pos;
+            index = data_r.index;
+            capture_change = data_r.capture_change;
+            start = data_r.start;
+            count = data_r.count;
+
+            /* The repeat failed to match. */
+            rp_data = &state->repeats[index];
+
+            /* The body may have failed to match at this position. */
+            if (!guard_repeat(state, index, text_pos, RE_STATUS_BODY, TRUE))
+                return RE_ERROR_MEMORY;
+
+            /* Restore the previous repeat. */
+            rp_data->count = count;
+            rp_data->start = start;
+            rp_data->capture_change = capture_change;
+            break;
+        }
         case RE_OP_CONDITIONAL: /* Conditional subpattern. */
         {
             RE_Node* conditional;
@@ -15822,49 +18865,6 @@ backtrack:
              */
             break;
         }
-        case RE_OP_EXEC_CODE:
-        case RE_OP_EXEC_CODE_REV: /* Embedded python code. */
-        {
-            RE_Node* code_node;
-            int status;
-            Py_ssize_t code_result;
-
-            /* bstack: code_node */
-
-            if (!pop_pointer(state, &state->bstack, (void*)&code_node))
-                return RE_ERROR_MEMORY;
-
-            /* bstack: - */
-
-            TRACE(("%s %d %d\n", re_op_text[op], code_node->values[0],
-              code_node->values[1]))
-
-            /* Skip code when CODE is not set or code has been dropped. */
-            if (!state->run_code || pattern->code_dropped)
-                break;
-
-            state->backtracking = TRUE;
-            status = code_run(state, &code_result, code_node->status,
-              code_node->values[0], code_node->values[1], FALSE, 0);
-
-            if (status != RE_ERROR_SUCCESS)
-                return status;
-
-            switch (code_result) {
-            case RE_CODE_ADVANCE:
-                if (!push_pointer(state, &state->bstack, code_node))
-                    return RE_ERROR_MEMORY;
-                if (!push_uint8(state, &state->bstack, code_node->op))
-                    return RE_ERROR_MEMORY;
-
-                /* bstack: code_node op */
-
-                node = code_node->next_1.node;
-                goto advance;
-            }
-
-            break;
-        }
         case RE_OP_FAILURE: /* Failure. */
             TRACE(("%s\n", re_op_text[op]))
 
@@ -15962,43 +18962,6 @@ backtrack:
 
             string_pos = -1;
             break;
-        case RE_OP_GREEDY_REPEAT: /* Greedy repeat. */
-        case RE_OP_LAZY_REPEAT: /* Lazy repeat. */
-        {
-            RE_RepeatStateData data_r;
-            Py_ssize_t text_pos;
-            RE_CODE index;
-            size_t capture_change;
-            Py_ssize_t start;
-            size_t count;
-            RE_RepeatData* rp_data;
-            TRACE(("%s\n", re_op_text[op]))
-
-            /* bstack: count start capture_change index text_pos */
-
-            if (!ByteStack_pop_block(state, &state->bstack, (void*)&data_r,
-              sizeof(data_r)))
-                return RE_ERROR_MEMORY;
-
-            text_pos = data_r.text_pos;
-            index = data_r.index;
-            capture_change = data_r.capture_change;
-            start = data_r.start;
-            count = data_r.count;
-
-            /* The repeat failed to match. */
-            rp_data = &state->repeats[index];
-
-            /* The body may have failed to match at this position. */
-            if (!guard_repeat(state, index, text_pos, RE_STATUS_BODY, TRUE))
-                return RE_ERROR_MEMORY;
-
-            /* Restore the previous repeat. */
-            rp_data->count = count;
-            rp_data->start = start;
-            rp_data->capture_change = capture_change;
-            break;
-        }
         case RE_OP_GREEDY_REPEAT_ONE: /* Greedy repeat for one character. */
         {
             RE_RepeatOneStateData data_ro;
@@ -18451,12 +21414,16 @@ Py_LOCAL_INLINE(void) dealloc_groups(RE_GroupData* groups, size_t group_count)
     re_dealloc(groups);
 }
 
+/* Forward reference. */
+Py_LOCAL_INLINE(PyObject*) call(char* module_name, char* function_name,
+  PyObject* args);
+
 /* Initialises a state object. */
 Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
   PyObject* string, RE_StringInfo* str_info, Py_ssize_t start, Py_ssize_t end,
   BOOL overlapped, int concurrent, BOOL partial, BOOL use_lock, BOOL
   visible_captures, BOOL match_all, Py_ssize_t timeout, PyObject* run_code,
-  PyObject* globals, PyObject* locals) {
+  PyObject* globals, PyObject* locals, PyObject* callouts) {
     Py_ssize_t final_pos;
     int p;
 
@@ -18645,7 +21612,6 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
         state->run_code = (pattern->flags & RE_FLAG_CODE) != 0;
     else
         state->run_code = run_code == Py_True;
-    state->backtracking = FALSE;
     state->locked = FALSE;
 
     state->pattern = pattern;
@@ -18706,6 +21672,27 @@ Py_LOCAL_INLINE(BOOL) state_init_2(RE_State* state, PatternObject* pattern,
         state->locals = locals;
         Py_INCREF(state->locals);
     }
+    if (callouts == Py_None)
+        state->call_code = pattern->call_code;
+    else
+        state->call_code = call("regex.regex", "_validate_and_get_callouts",
+          PyTuple_Pack(2, callouts, pattern->callindex));
+    if (pattern->call_code_count) {
+        state->called_code = (PyObject**)re_alloc(pattern->call_code_count *
+          sizeof(PyObject*));
+        if (!state->called_code) {
+            Py_DECREF(state->globals);
+            Py_DECREF(state->locals);
+            goto error;
+        }
+        
+        size_t i;
+        
+        for (i = 0; i < pattern->call_code_count; i++)
+            state->called_code[i] = PyTuple_GET_ITEM(pattern->call_code, i);
+    } else
+        state->called_code = NULL;
+    Py_INCREF(state->call_code);
 
     Py_INCREF(state->pattern);
     Py_INCREF(state->string);
@@ -18773,6 +21760,34 @@ Py_LOCAL_INLINE(BOOL) check_compatible(PatternObject* pattern, BOOL unicode) {
     return TRUE;
 }
 
+/* Checks a 'globals' argument. */
+Py_LOCAL_INLINE(BOOL) check_globals(PyObject* globals) {
+    if (globals != Py_None && !PyDict_Check(globals)) {
+        PyErr_SetString(PyExc_ValueError, "globals neither None nor dict");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Checks a 'locals' argument. */
+Py_LOCAL_INLINE(BOOL) check_locals(PyObject* locals) {
+    if (locals != Py_None && !PyMapping_Check(locals)) {
+        PyErr_SetString(PyExc_ValueError,
+          "locals neither None nor support __getitem__");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Checks a 'callouts' argument. */
+Py_LOCAL_INLINE(BOOL) check_callouts(PyObject* callouts) {
+    if (callouts != Py_None && !PyDict_Check(callouts)) {
+        PyErr_SetString(PyExc_ValueError, "callouts neither None nor dict");
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* Releases the string's buffer, if necessary. */
 Py_LOCAL_INLINE(void) release_buffer(RE_StringInfo* str_info) {
     if (str_info->should_release)
@@ -18783,7 +21798,8 @@ Py_LOCAL_INLINE(void) release_buffer(RE_StringInfo* str_info) {
 Py_LOCAL_INLINE(BOOL) state_init(RE_State* state, PatternObject* pattern,
   PyObject* string, Py_ssize_t start, Py_ssize_t end, BOOL overlapped, int
   concurrent, BOOL partial, BOOL use_lock, BOOL visible_captures, BOOL
-  match_all, Py_ssize_t timeout, PyObject* run_code, PyObject* globals, PyObject* locals) {
+  match_all, Py_ssize_t timeout, PyObject* run_code, PyObject* globals,
+  PyObject* locals, PyObject* callouts) {
     RE_StringInfo str_info;
 
     /* Get the string to search or match. */
@@ -18797,10 +21813,14 @@ Py_LOCAL_INLINE(BOOL) state_init(RE_State* state, PatternObject* pattern,
         release_buffer(&str_info);
         return FALSE;
     }
+    
+    if (!check_globals(globals) || !check_locals(locals) ||
+      !check_callouts(callouts))
+        return FALSE;
 
     if (!state_init_2(state, pattern, string, &str_info, start, end,
       overlapped, concurrent, partial, use_lock, visible_captures, match_all,
-      timeout, run_code, globals, locals)) {
+      timeout, run_code, globals, locals, callouts)) {
         release_buffer(&str_info);
         return FALSE;
     }
@@ -18879,6 +21899,9 @@ Py_LOCAL_INLINE(void) state_fini(RE_State* state) {
     ByteStack_fini(state, &state->bstack);
     ByteStack_fini(state, &state->pstack);
 
+    if (state->called_code)
+        re_dealloc(state->called_code);
+
     if (state->best_match_groups)
         dealloc_groups(state->best_match_groups, pattern->true_group_count);
 
@@ -18906,6 +21929,7 @@ Py_LOCAL_INLINE(void) state_fini(RE_State* state) {
     Py_DECREF(state->pattern);
     Py_DECREF(state->globals);
     Py_DECREF(state->locals);
+    Py_DECREF(state->call_code);
     Py_DECREF(state->string);
 
     if (state->should_release)
@@ -21002,9 +24026,7 @@ static PyObject* state_advance(StateObject* self) {
         return NULL;
     }
 
-    self->advance = TRUE;
-    self->fail = FALSE;
-    self->case_index = -1;
+    self->code_result = RE_CODE_ADVANCE;
 
     Py_RETURN_NONE;
 }
@@ -21016,59 +24038,124 @@ static PyObject* state_fail(StateObject* self) {
         return NULL;
     }
 
-    self->advance = FALSE;
-    self->fail = TRUE;
-    self->case_index = -1;
+    self->code_result = RE_CODE_FAIL;
 
     Py_RETURN_NONE;
 }
 
-/* StateObject's 'case' method. */
-static PyObject* state_case(StateObject* self, PyObject* arg) {
-    Py_ssize_t index;
+/* StateObject's 'branch' method. */
+static PyObject* state_branch(StateObject* self, PyObject* arg) {
+    Py_ssize_t branch;
 
     if (!self->valid) {
         set_error(RE_ERROR_INVALID_STATE, NULL);
         return NULL;
     } else if (!self->in_conditional) {
-        PyErr_SetString(PyExc_TypeError, "case only allowed in conditionals");
+        PyErr_SetString(PyExc_TypeError,
+          "branch is only allowed in conditionals");
         return NULL;
     } else if (!PyLong_Check(arg)) {
-        PyErr_SetString(PyExc_TypeError, "case index must be an integer");
+        PyErr_SetString(PyExc_TypeError, "argument must be an integer");
         return NULL;
     }
 
-    index = (Py_ssize_t)PyLong_AsLong(arg);
-    if (index == -1 && PyErr_Occurred())
+    branch = (Py_ssize_t)PyLong_AsLong(arg);
+    if (branch == -1 && PyErr_Occurred())
         return NULL;
 
-    if (index < 0) {
-        PyErr_SetString(PyExc_ValueError, "case index has to be positive");
+    if (branch < 0) {
+        PyErr_SetString(PyExc_ValueError, "branch should be positive");
         return NULL;
-    } else if (index >= self->max_index) {
-        PyErr_Format(PyExc_ValueError, "case index should be no more than %zu",
-          self->max_index - 1);
+    } else if (branch < self->min_number && self->min_number >= 0) {
+        PyErr_Format(PyExc_ValueError,
+          "branch should be no less than %" PY_FORMAT_SIZE_T "d",
+          self->min_number);
         return NULL;
-    } else {
-        self->advance = FALSE;
-        self->fail = FALSE;
-        self->case_index = index;
+    } else if (branch >= self->max_number && self->max_number >= 0) {
+        PyErr_Format(PyExc_ValueError,
+          "branch should be no more than %" PY_FORMAT_SIZE_T "d",
+          self->max_number - 1);
+        return NULL;
     }
+
+    self->code_result = RE_CODE_BRANCH;
+    self->number = branch;
+
+    Py_RETURN_NONE;
+}
+
+/* StateObject's 'next' method. */
+static PyObject* state_next(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    } else if (!self->in_repeat) {
+        PyErr_SetString(PyExc_TypeError, "next is only allowed in repeats");
+        return NULL;
+    }
+
+    self->code_result = RE_CODE_NEXT;
+
+    Py_RETURN_NONE;
+}
+
+/* StateObject's 'optional' method. */
+static PyObject* state_optional(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    } else if (!self->in_repeat) {
+        PyErr_SetString(PyExc_TypeError, "optional is only allowed in repeats");
+        return NULL;
+    }
+
+    self->code_result = RE_CODE_OPTIONAL;
+
+    Py_RETURN_NONE;
+}
+
+/* StateObject's 'lazy' method. */
+static PyObject* state_lazy(StateObject* self) {
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    } else if (!self->in_repeat) {
+        PyErr_SetString(PyExc_TypeError, "lazy is only allowed in repeats");
+        return NULL;
+    }
+
+    self->code_result = RE_CODE_LAZY;
 
     Py_RETURN_NONE;
 }
 
 PyDoc_STRVAR(state_advance_doc,
   "advance() --> None.\n\
-  Causes the engine to advance after the execution of code ends.");
+  Causes the engine to advance after the execution of code ends.\n\
+  Conditional: skip the entire conditional.\n\
+  Repeat: stop matching the repeated pattern.");
 
 PyDoc_STRVAR(state_fail_doc,
   "fail() --> None.\n\
-  Causes the engine to backtrack after the execution of code ends.");
+  Causes the engine to backtrack after the execution of code ends.\n");
 
-PyDoc_STRVAR(state_case_doc,
-  "case(num: int) --> None.\n\
+PyDoc_STRVAR(state_branch_doc,
+  "branch(num: int) --> None.\n\
   Only in conditional, matches the specified branch next.");
+
+PyDoc_STRVAR(state_next_doc,
+  "next() --> None.\n\
+  Only in repeat, backtracks if the subpattern cannot match.");
+
+PyDoc_STRVAR(state_optional_doc,
+  "optional() --> None.\n\
+  Only in repeat, attempts an additional match, but exits the repeat if\n\
+  a match is not possible.");
+
+PyDoc_STRVAR(state_lazy_doc,
+  "lazy() --> None.\n\
+  Only in repeat, attempts to skip the match, but tries a\n\
+  match on backtracking.");
 
 /* StateObject's methods. */
 static PyMethodDef state_methods[] = {
@@ -21094,7 +24181,10 @@ static PyMethodDef state_methods[] = {
     {"allspans", (PyCFunction)state_allspans, METH_NOARGS, match_allspans_doc},
     {"advance", (PyCFunction)state_advance, METH_NOARGS, state_advance_doc},
     {"fail", (PyCFunction)state_fail, METH_NOARGS, state_fail_doc},
-    {"case", (PyCFunction)state_case, METH_O, state_case_doc},
+    {"branch", (PyCFunction)state_branch, METH_O, state_branch_doc},
+    {"next", (PyCFunction)state_next, METH_NOARGS, state_next_doc},
+    {"optional", (PyCFunction)state_optional, METH_NOARGS, state_optional_doc},
+    {"lazy", (PyCFunction)state_lazy, METH_NOARGS, state_lazy_doc},
     {"__copy__", (PyCFunction)state_copy, METH_NOARGS},
     {"__deepcopy__", (PyCFunction)state_deepcopy, METH_O},
     {"__getitem__", (PyCFunction)state_getitem, METH_O|METH_COEXIST},
@@ -21145,6 +24235,37 @@ static int state_run_code_set(PyObject* self_, PyObject* value, void* unused) {
     return 0;
 }
 
+/* StateObject's 'repetitions' attribute. */
+static PyObject* state_repetitions(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+    
+    return Py_BuildValue("n", self->repetitions);
+}
+
+/* StateObject's 'backtracking' attribute. */
+static PyObject* state_backtracking(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->backtracking)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
+}
+
 /* StateObject's 'in_conditional' attribute. */
 static PyObject* state_in_conditional(PyObject* self_, void* unused) {
     StateObject* self;
@@ -21157,6 +24278,23 @@ static PyObject* state_in_conditional(PyObject* self_, void* unused) {
     }
 
     if (self->in_conditional)
+        Py_RETURN_TRUE;
+
+    Py_RETURN_FALSE;
+}
+
+/* StateObject's 'in_repeat' attribute. */
+static PyObject* state_in_repeat(PyObject* self_, void* unused) {
+    StateObject* self;
+
+    self = (StateObject*)self_;
+
+    if (!self->valid) {
+        set_error(RE_ERROR_INVALID_STATE, NULL);
+        return NULL;
+    }
+
+    if (self->in_repeat)
         Py_RETURN_TRUE;
 
     Py_RETURN_FALSE;
@@ -21932,23 +25070,6 @@ static PyObject* state_is_fuzzy(PyObject* self_, void* unused) {
     Py_RETURN_FALSE;
 }
 
-/* StateObject's 'backtracking' attribute. */
-static PyObject* state_backtracking(PyObject* self_, void* unused) {
-    StateObject* self;
-
-    self = (StateObject*)self_;
-
-    if (!self->valid) {
-        set_error(RE_ERROR_INVALID_STATE, NULL);
-        return NULL;
-    }
-
-    if (self->state->backtracking)
-        Py_RETURN_TRUE;
-
-    Py_RETURN_FALSE;
-}
-
 /* StateObject's 'locked' attribute. */
 static PyObject* state_locked(PyObject* self_, void* unused) {
     StateObject* self;
@@ -21969,8 +25090,14 @@ static PyObject* state_locked(PyObject* self_, void* unused) {
 static PyGetSetDef state_getset[] = {
     {"run_code", (getter)state_run_code_get, (setter)state_run_code_set,
       "Whether to execute or skip embedded code."},
+    {"repetitions", (getter)state_repetitions, (setter)NULL,
+      "How often the match was repeated."},
+    {"backtracking", (getter)state_backtracking, (setter)NULL,
+      "Whether the engine is backtracking."},
     {"in_conditional", (getter)state_in_conditional, (setter)NULL,
       "Whether the code is used as a conditional."},
+    {"in_repeat", (getter)state_in_repeat, (setter)NULL,
+      "Whether the code is used as a repeat."},
     {"pattern", (getter)state_pattern, (setter)NULL,
       "The regex object that produced this match object."},
     {"string", (getter)state_string, (setter)NULL,
@@ -22075,8 +25202,6 @@ static PyGetSetDef state_getset[] = {
       "Whether a POSIX match has been found."},
     {"is_fuzzy", (getter)state_is_fuzzy, (setter)NULL,
       "Whether the pattern is fuzzy."},
-    {"backtracking", (getter)state_backtracking, (setter)NULL,
-      "Whether the engine is backtracking."},
     {"locked", (getter)state_locked, (setter)NULL,
       "Whether the state is locked."},
     {NULL} /* Sentinel */
@@ -22544,6 +25669,13 @@ Py_LOCAL_INLINE(Py_ssize_t) decode_timeout(PyObject* timeout) {
     return value >= 0.0 ? (Py_ssize_t)(value * CLOCKS_PER_SEC) : RE_NO_TIMEOUT;
 }
 
+/* Gets a 'run_code' argument. */
+Py_LOCAL_INLINE(PyObject*) get_run_code(PyObject* run_code) {
+    if (run_code == Py_None)
+        return run_code;
+    return PyObject_IsTrue(run_code) ? Py_True : Py_False;
+}
+
 /* Creates a new ScannerObject. */
 static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
   PyObject* kwargs) {
@@ -22565,11 +25697,13 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "overlapped",
-      "concurrent", "partial", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOOO:scanner", kwlist,
-      &string, &pos, &endpos, &overlapped, &concurrent, &partial, &timeout,
-      &run_code, &globals, &locals))
+      "concurrent", "partial", "timeout", "code", "globals", "locals",
+      "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOOOO:scanner",
+      kwlist, &string, &pos, &endpos, &overlapped, &concurrent, &partial,
+      &timeout, &run_code, &globals, &locals, &callouts))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -22589,18 +25723,8 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
         return NULL;
 
     part = decode_partial(partial);
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     /* Create a scanner object. */
     self = PyObject_NEW(ScannerObject, &Scanner_Type);
@@ -22613,7 +25737,8 @@ static PyObject* pattern_scanner(PatternObject* pattern, PyObject* args,
 
     /* The MatchObject, and therefore repeated captures, will be visible. */
     if (!state_init(&self->state, pattern, string, start, end, overlapped != 0,
-      conc, part, TRUE, TRUE, FALSE, tim, run_code, globals, locals)) {
+      conc, part, TRUE, TRUE, FALSE, tim, run_code, globals, locals,
+      callouts)) {
         Py_DECREF(self);
         return NULL;
     }
@@ -23081,10 +26206,12 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "string", "maxsplit", "concurrent", "timeout",
-      "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOO:splitter", kwlist,
-      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals))
+      "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOOO:splitter", kwlist,
+      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals,
+      &callouts))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -23094,18 +26221,8 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     /* Create a splitter object. */
     self = PyObject_NEW(SplitterObject, &Splitter_Type);
@@ -23122,7 +26239,8 @@ Py_LOCAL_INLINE(PyObject*) pattern_splitter(PatternObject* pattern, PyObject*
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&self->state, pattern, string, 0, PY_SSIZE_T_MAX, FALSE,
-      conc, FALSE, TRUE, FALSE, FALSE, tim, run_code, globals, locals)) {
+      conc, FALSE, TRUE, FALSE, FALSE, tim, run_code, globals, locals,
+      callouts)) {
         Py_DECREF(self);
         return NULL;
     }
@@ -23158,8 +26276,9 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "concurrent",
-      "partial", "timeout", "code", "globals", "locals", NULL };
+      "partial", "timeout", "code", "globals", "locals", "callouts", NULL };
     /* When working with a short string, such as a line from a file, the
      * relative cost of PyArg_ParseTupleAndKeywords can be significant, and
      * it's worth not using it when there are only positional arguments.
@@ -23170,7 +26289,7 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
     else
         arg_count = -1;
 
-    if (1 <= arg_count && arg_count <= 9) {
+    if (1 <= arg_count && arg_count <= 10) {
         /* PyTuple_GET_ITEM borrows the reference. */
         string = PyTuple_GET_ITEM(args, 0);
         if (arg_count >= 2)
@@ -23189,9 +26308,11 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
             globals = PyTuple_GET_ITEM(args, 7);
         if (arg_count >= 9)
             locals = PyTuple_GET_ITEM(args, 8);
+        if (arg_count >= 10)
+            callouts = PyTuple_GET_ITEM(args, 9);
     } else if (!PyArg_ParseTupleAndKeywords(args, kwargs, args_desc, kwlist,
       &string, &pos, &endpos, &concurrent, &partial, &timeout, &run_code,
-      &globals, &locals))
+      &globals, &locals, &callouts))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -23211,22 +26332,12 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
         return NULL;
 
     part = decode_partial(partial);
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     /* The MatchObject, and therefore repeated captures, will be visible. */
     if (!state_init(&state, self, string, start, end, FALSE, conc, part, FALSE,
-      TRUE, match_all, tim, run_code, globals, locals))
+      TRUE, match_all, tim, run_code, globals, locals, callouts))
         return NULL;
 
     status = do_match(&state, search);
@@ -23245,21 +26356,21 @@ Py_LOCAL_INLINE(PyObject*) pattern_search_or_match(PatternObject* self,
 /* PatternObject's 'match' method. */
 static PyObject* pattern_match(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:match",
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOOO:match",
       FALSE, FALSE);
 }
 
 /* PatternObject's 'fullmatch' method. */
 static PyObject* pattern_fullmatch(PatternObject* self, PyObject* args,
   PyObject* kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:fullmatch",
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOOO:fullmatch",
       FALSE, TRUE);
 }
 
 /* PatternObject's 'search' method. */
 static PyObject* pattern_search(PatternObject* self, PyObject* args, PyObject*
   kwargs) {
-    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOO:search",
+    return pattern_search_or_match(self, args, kwargs, "O|OOOOOOOOO:search",
       TRUE, FALSE);
 }
 
@@ -23366,7 +26477,7 @@ Py_LOCAL_INLINE(PyObject*) get_sub_replacement(PyObject* item, PyObject*
 Py_LOCAL_INLINE(PyObject*) pattern_subx(PatternObject* self, PyObject*
   str_template, PyObject* string, Py_ssize_t maxsub, int sub_type, PyObject*
   pos, PyObject* endpos, int concurrent, Py_ssize_t timeout, PyObject* run_code,
-  PyObject* globals, PyObject* locals) {
+  PyObject* globals, PyObject* locals, PyObject* callouts) {
     RE_StringInfo str_info;
     Py_ssize_t start;
     Py_ssize_t end;
@@ -23490,7 +26601,7 @@ Py_LOCAL_INLINE(PyObject*) pattern_subx(PatternObject* self, PyObject*
      */
     if (!state_init_2(&state, self, string, &str_info, start, end, FALSE,
       concurrent, FALSE, FALSE, is_callable || (sub_type & RE_SUBF) != 0,
-      FALSE, timeout, run_code, globals, locals)) {
+      FALSE, timeout, run_code, globals, locals, callouts)) {
         release_buffer(&str_info);
         Py_XDECREF(replacement);
         return NULL;
@@ -23760,11 +26871,12 @@ static PyObject* pattern_sub(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "repl", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:sub", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOOO:sub", kwlist,
       &replacement, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &run_code, &globals, &locals))
+      &run_code, &globals, &locals, &callouts))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -23774,21 +26886,11 @@ static PyObject* pattern_sub(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     return pattern_subx(self, replacement, string, count, RE_SUB, pos, endpos,
-      conc, tim, run_code, globals, locals);
+      conc, tim, run_code, globals, locals, callouts);
 }
 
 /* PatternObject's 'subf' method. */
@@ -23807,11 +26909,13 @@ static PyObject* pattern_subf(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "format", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:sub", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", "callouts",
+      NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOOO:sub", kwlist,
       &format, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &run_code, &globals, &locals))
+      &run_code, &globals, &locals, &callouts))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -23821,21 +26925,11 @@ static PyObject* pattern_subf(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     return pattern_subx(self, format, string, count, RE_SUBF, pos, endpos,
-      conc, tim, run_code, globals, locals);
+      conc, tim, run_code, globals, locals, callouts);
 }
 
 /* PatternObject's 'subn' method. */
@@ -23854,11 +26948,12 @@ static PyObject* pattern_subn(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "repl", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:subn", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOOO:subn", kwlist,
       &replacement, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &run_code, &globals, &locals))
+      &run_code, &globals, &locals, &callouts))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -23868,21 +26963,11 @@ static PyObject* pattern_subn(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     return pattern_subx(self, replacement, string, count, RE_SUBN, pos, endpos,
-      conc, tim, run_code, globals, locals);
+      conc, tim, run_code, globals, locals, callouts);
 }
 
 /* PatternObject's 'subfn' method. */
@@ -23901,11 +26986,12 @@ static PyObject* pattern_subfn(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "format", "string", "count", "pos", "endpos",
-      "concurrent", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOO:subn", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|nOOOOOOOO:subn", kwlist,
       &format, &string, &count, &pos, &endpos, &concurrent, &timeout,
-      &run_code, &globals, &locals))
+      &run_code, &globals, &locals, &callouts))
         return NULL;
 
     conc = decode_concurrent(concurrent);
@@ -23915,21 +27001,11 @@ static PyObject* pattern_subfn(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     return pattern_subx(self, format, string, count, RE_SUBF | RE_SUBN, pos,
-      endpos, conc, tim, run_code, globals, locals);
+      endpos, conc, tim, run_code, globals, locals, callouts);
 }
 
 /* PatternObject's 'split' method. */
@@ -23957,10 +27033,12 @@ static PyObject* pattern_split(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "string", "maxsplit", "concurrent", "timeout",
-      "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOO:split", kwlist,
-      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals))
+      "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|nOOOOOO:split", kwlist,
+      &string, &maxsplit, &concurrent, &timeout, &run_code, &globals, &locals,
+      &callouts))
         return NULL;
 
     if (maxsplit == 0)
@@ -23973,23 +27051,13 @@ static PyObject* pattern_split(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&state, self, string, 0, PY_SSIZE_T_MAX, FALSE, conc,
-      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals))
+      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals, callouts))
         return NULL;
 
     list = PyList_New(0);
@@ -24144,11 +27212,12 @@ static PyObject* pattern_findall(PatternObject* self, PyObject* args, PyObject*
     PyObject* run_code = Py_None;
     PyObject* globals = Py_None;
     PyObject* locals = Py_None;
+    PyObject* callouts = Py_None;
     static char* kwlist[] = { "string", "pos", "endpos", "overlapped",
-      "concurrent", "timeout", "code", "globals", "locals", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOO:findall", kwlist,
+      "concurrent", "timeout", "code", "globals", "locals", "callouts", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|OOnOOOOOO:findall", kwlist,
       &string, &pos, &endpos, &overlapped, &concurrent, &timeout, &run_code,
-      &globals, &locals))
+      &globals, &locals, &callouts))
         return NULL;
 
     start = as_string_index(pos, 0);
@@ -24166,23 +27235,13 @@ static PyObject* pattern_findall(PatternObject* self, PyObject* args, PyObject*
     tim = decode_timeout(timeout);
     if (tim == RE_BAD_TIMEOUT)
         return NULL;
-
-    if (run_code != Py_None)
-        run_code = PyObject_IsTrue(run_code) ? Py_True : Py_False;
-
-    if (globals != Py_None && !PyDict_Check(globals)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
-        return NULL;
-    }
+    
+    run_code = get_run_code(run_code);
 
     /* The MatchObject, and therefore repeated captures, will not be visible.
      */
     if (!state_init(&state, self, string, start, end, overlapped != 0, conc,
-      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals))
+      FALSE, FALSE, FALSE, FALSE, tim, run_code, globals, locals, callouts))
         return NULL;
 
     list = PyList_New(0);
@@ -24281,30 +27340,51 @@ static PyObject* pattern_drop_code(PatternObject* pattern) {
 
     pattern->code_dropped = TRUE;
 
-    if (pattern->code_count) {
-        for (i = 0; i < pattern->code_count; i++)
+    if (pattern->exec_code_count) {
+        for (i = 0; i < pattern->exec_code_count; i++)
             Py_XDECREF(pattern->compiled_code);
 
         re_dealloc(pattern->compiled_code);
     }
+
     Py_XDECREF(pattern->globals);
     Py_XDECREF(pattern->locals);
     Py_XDECREF(pattern->code);
     Py_XDECREF(pattern->codeindex);
+    Py_XDECREF(pattern->callindex);
+    Py_XDECREF(pattern->indexcall);
+    Py_XDECREF(pattern->call_code);
 
     pattern->globals = PyDict_New();
+    if (!pattern->globals)
+        goto error;
     pattern->locals = PyDict_New();
+    if (!pattern->locals)
+        goto error;
     pattern->code = PyTuple_New(0);
+    if (!pattern->code)
+        goto error;
     pattern->codeindex = PyDict_New();
+    if (!pattern->codeindex)
+        goto error;
     pattern->compiled_code = NULL;
-    pattern->code_count = 0;
-    if (!pattern->globals || !pattern->locals || !pattern->code ||
-      !pattern->codeindex) {
-        set_error(RE_ERROR_MEMORY, NULL);
-        return NULL;
-    }
+    pattern->callindex = PyDict_New();
+    if (!pattern->callindex)
+        goto error;
+    pattern->indexcall = PyDict_New();
+    if (!pattern->indexcall)
+        goto error;
+    pattern->call_code = PyTuple_New(0);
+    if (!pattern->call_code)
+        goto error;
+    pattern->exec_code_count = 0;
+    pattern->call_code_count = 0;
 
     Py_RETURN_NONE;
+
+error:
+    set_error(RE_ERROR_MEMORY, NULL);
+    return NULL;
 }
 
 /* Makes a copy of a PatternObject.
@@ -24504,8 +27584,8 @@ static void pattern_dealloc(PyObject* self_) {
 
     re_dealloc(self->stack_storage);
 
-    if (self->code_count) {
-        for (i = 0; i < self->code_count; i++)
+    if (self->exec_code_count) {
+        for (i = 0; i < self->exec_code_count; i++)
             Py_XDECREF(self->compiled_code);
 
         re_dealloc(self->compiled_code);
@@ -24514,7 +27594,6 @@ static void pattern_dealloc(PyObject* self_) {
     if (self->weakreflist)
         PyObject_ClearWeakRefs((PyObject*)self);
     Py_XDECREF(self->pattern);
-    Py_XDECREF(self->modified_pattern);
     Py_XDECREF(self->module);
     Py_XDECREF(self->groupindex);
     Py_XDECREF(self->indexgroup);
@@ -24523,6 +27602,9 @@ static void pattern_dealloc(PyObject* self_) {
     Py_XDECREF(self->state);
     Py_XDECREF(self->code);
     Py_XDECREF(self->codeindex);
+    Py_XDECREF(self->callindex);
+    Py_XDECREF(self->indexcall);
+    Py_XDECREF(self->call_code);
 
     for (partial_side = 0; partial_side < 2; partial_side++) {
         if (self->partial_named_lists[partial_side]) {
@@ -24835,7 +27917,7 @@ static PyObject* pattern_repr(PyObject* self_) {
     if (!append_string(list, "regex.Regex("))
         goto error;
 
-    item = PyObject_Repr(self->modified_pattern);
+    item = PyObject_Repr(self->pattern);
     if (!item)
         goto error;
 
@@ -24964,10 +28046,8 @@ static PyObject* pattern_globals_get(PyObject* self_) {
 static int pattern_globals_set(PyObject* self_, PyObject* value) {
     PatternObject* self;
 
-    if (!PyDict_Check(value)) {
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
+    if (!check_globals(value))
         return -1;
-    }
 
     self = (PatternObject*)self_;
 
@@ -24992,16 +28072,83 @@ static PyObject* pattern_locals_get(PyObject* self_) {
 static int pattern_locals_set(PyObject* self_, PyObject* value) {
     PatternObject* self;
 
-    if (!PyMapping_Check(value)) {
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
+    if (!check_locals(value))
         return -1;
-    }
 
     self = (PatternObject*)self_;
 
     Py_DECREF(self->locals);
     self->locals = value;
     Py_INCREF(self->locals);
+
+    return 0;
+}
+
+/* PatternObject's 'callouts' getter method. */
+static PyObject* pattern_callouts_get(PyObject* self_) {
+    PatternObject* self;
+    PyObject* result;
+    PyObject* keys;
+    size_t i;
+    
+    self = (PatternObject*)self_;
+    
+    result = PyDict_New();
+    if (!result)
+        return NULL;
+    
+    keys = PyMapping_Keys(self->callindex);
+    if (!keys)
+        goto failed;
+    
+    for (i = 0; i < self->call_code_count; i++) {
+        PyObject* key;
+        PyObject* value;
+        int status;
+        
+        /* PyList_GetItem borrows a reference. */
+        key = PyList_GetItem(keys, i);
+        if (!key)
+            goto failed;
+        
+        /* PyTuple_GetItem borrows a reference. */
+        value = PyTuple_GetItem(self->call_code, i);
+        if (!value)
+            goto failed;
+        
+        status = PyDict_SetItem(result, key, value);
+        if (status < 0)
+            goto failed;
+    }
+    
+    Py_DECREF(keys);
+    
+    return result;
+
+failed:
+    Py_XDECREF(keys);
+    Py_DECREF(result);
+    return NULL;
+}
+
+/* PatternObject's 'callouts' setter method. */
+static int pattern_callouts_set(PyObject* self_, PyObject* value) {
+    PatternObject* self;
+    PyObject* replacement;
+
+    if (!check_callouts(value))
+        return -1;
+
+    self = (PatternObject*)self_;
+    
+    replacement = call("regex.regex", "_validate_and_get_callouts",
+      PyTuple_Pack(2, value, self->callindex));
+    if (!replacement)
+        return -1;
+
+    Py_DECREF(self->call_code);
+    self->call_code = replacement;
+    Py_INCREF(self->call_code);
 
     return 0;
 }
@@ -25019,12 +28166,12 @@ static PyObject* pattern_pickled_data(PyObject* self_) {
      * Globals and locals are set to None to avoid pickling unrelated data and
      * because they're usually just references.
      */
-    pickled_data = Py_BuildValue("OnOOOOOnOnnOOOOO", self->pattern,
+    pickled_data = Py_BuildValue("OnOOOOOnOnnOOOOOOO", self->pattern,
       self->flags & ~RE_FLAG_CODE, self->packed_code_list, self->groupindex,
       self->indexgroup, self->named_lists, self->named_list_indexes,
       self->req_offset, self->required_chars, self->req_flags,
       self->public_group_count, self->code, Py_None, Py_None,
-      self->modified_pattern, self->codeindex);
+      self->codeindex, self->callindex, self->indexcall, self->call_code);
 
     return pickled_data;
 }
@@ -25040,16 +28187,16 @@ static PyGetSetDef pattern_getset[] = {
       "The global dict used for embedded code."},
     {"locals", (getter)pattern_locals_get, (setter)pattern_locals_set,
       "The local dict used for embedded code."},
+    {"callouts", (getter)pattern_callouts_get, (setter)pattern_callouts_set,
+      "The callouts dict used for callouts."},
     {"_pickled_data", (getter)pattern_pickled_data, (setter)NULL,
       "Data used for pickling."},
     {NULL} /* Sentinel */
 };
 
 static PyMemberDef pattern_members[] = {
-    {"pattern", T_OBJECT, offsetof(PatternObject, modified_pattern), READONLY,
+    {"pattern", T_OBJECT, offsetof(PatternObject, pattern), READONLY,
       "The pattern string from which the regex object was compiled."},
-    {"original_pattern", T_OBJECT, offsetof(PatternObject, pattern), READONLY,
-      "The pattern before it was parsed."},
     {"state", T_OBJECT, offsetof(PatternObject, state), READONLY,
       "The internal state during matching."},
     {"flags", T_PYSSIZET, offsetof(PatternObject, flags), READONLY,
@@ -25239,15 +28386,15 @@ Py_LOCAL_INLINE(RE_STATUS_T) add_repeat_guards(PatternObject* pattern, RE_Node*
                 }
                 break;
             }
-            case RE_OP_END_GREEDY_REPEAT:
-            case RE_OP_END_LAZY_REPEAT:
-                node->status |= RE_STATUS_VISITED_AG;
-                break;
-            case RE_OP_EXEC_CODE_CONDITIONAL:
+            case RE_OP_CODE_CALL_CONDITIONAL:
+            case RE_OP_CODE_CALL_CONDITIONAL_HLT:
+            case RE_OP_CODE_EXEC_CONDITIONAL:
+            case RE_OP_CODE_EXEC_CONDITIONAL_HLT:
             {
                 RE_Node* tail;
                 BOOL visited_all;
-                Py_ssize_t i;
+                size_t i;
+                Py_ssize_t j;
 
                 tail = node->next_1.node;
 
@@ -25276,14 +28423,65 @@ Py_LOCAL_INLINE(RE_STATUS_T) add_repeat_guards(PatternObject* pattern, RE_Node*
                 } else {
                     CheckStack_push(&stack, node, result);
 
-                    for (i = node->node_count - 1; i >= 0; i--)
-                        if (!(node->nodes[i].node->status &
+                    for (j = node->node_count - 1; j >= 0; j--)
+                        if (!(node->nodes[j].node->status &
                           RE_STATUS_VISITED_AG))
-                            CheckStack_push(&stack, node->nodes[i].node,
+                            CheckStack_push(&stack, node->nodes[j].node,
                               RE_STATUS_NEITHER);
 
                     if (!(tail->status & RE_STATUS_VISITED_AG))
                         CheckStack_push(&stack, tail, RE_STATUS_NEITHER);
+                }
+                break;
+            }
+            case RE_OP_CODE_CALL_END_REPEAT:
+            case RE_OP_CODE_CALL_END_REPEAT_HLT:
+            case RE_OP_CODE_EXEC_END_REPEAT:
+            case RE_OP_CODE_EXEC_END_REPEAT_HLT:
+            case RE_OP_END_GREEDY_REPEAT:
+            case RE_OP_END_LAZY_REPEAT:
+                node->status |= RE_STATUS_VISITED_AG;
+                break;
+            case RE_OP_CODE_CALL_REPEAT:
+            case RE_OP_CODE_CALL_REPEAT_HLT:
+            case RE_OP_CODE_EXEC_REPEAT:
+            case RE_OP_CODE_EXEC_REPEAT_HLT:
+            {
+                RE_Node* body;
+                RE_Node* tail;
+                BOOL visited_body;
+                BOOL visited_tail;
+
+                body = node->next_1.node;
+                tail = node->nonstring.next_2.node;
+                visited_body = (body->status & RE_STATUS_VISITED_AG);
+                visited_tail = (tail->status & RE_STATUS_VISITED_AG);
+
+                if (visited_body && visited_tail) {
+                    RE_STATUS_T body_result;
+                    RE_STATUS_T tail_result;
+                    RE_RepeatInfo* repeat_info;
+
+                    body_result = body->status & (RE_STATUS_REPEAT |
+                      RE_STATUS_REF);
+                    tail_result = tail->status & (RE_STATUS_REPEAT |
+                      RE_STATUS_REF);
+
+                    repeat_info = &pattern->repeat_info[node->values[0]];
+                    if (body_result != RE_STATUS_REF)
+                        repeat_info->status |= RE_STATUS_BODY;
+                    if (tail_result != RE_STATUS_REF)
+                        repeat_info->status |= RE_STATUS_TAIL;
+
+                    result = max_status_2(result, RE_STATUS_REPEAT);
+                    node->status |= RE_STATUS_VISITED_AG | max_status_3(result,
+                      body_result, tail_result);
+                } else {
+                    CheckStack_push(&stack, node, result);
+                    if (!visited_tail)
+                        CheckStack_push(&stack, tail, RE_STATUS_NEITHER);
+                    if (!visited_body)
+                        CheckStack_push(&stack, body, RE_STATUS_NEITHER);
                 }
                 break;
             }
@@ -25353,7 +28551,8 @@ Py_LOCAL_INLINE(RE_STATUS_T) add_repeat_guards(PatternObject* pattern, RE_Node*
                     RE_STATUS_T tail_result;
                     RE_RepeatInfo* repeat_info;
 
-                    limited = ~node->values[2] != 0;
+                    /* Checks the value_count to exlude code repeats. */
+                    limited = node->value_count == 4 && ~node->values[2] != 0;
 
                     tail_result = tail->status & (RE_STATUS_REPEAT |
                       RE_STATUS_REF);
@@ -25527,10 +28726,17 @@ Py_LOCAL_INLINE(BOOL) record_subpattern_repeats_and_fuzzy_sections(RE_Node*
         case RE_OP_END_FUZZY:
             node = node->next_1.node;
             break;
+        case RE_OP_CODE_CALL_END_REPEAT:
+        case RE_OP_CODE_CALL_END_REPEAT_HLT:
+        case RE_OP_CODE_EXEC_END_REPEAT:
+        case RE_OP_CODE_EXEC_END_REPEAT_HLT:
         case RE_OP_END_GREEDY_REPEAT:
         case RE_OP_END_LAZY_REPEAT:
             return TRUE;
-        case RE_OP_EXEC_CODE_CONDITIONAL:
+        case RE_OP_CODE_CALL_CONDITIONAL:
+        case RE_OP_CODE_CALL_CONDITIONAL_HLT:
+        case RE_OP_CODE_EXEC_CONDITIONAL:
+        case RE_OP_CODE_EXEC_CONDITIONAL_HLT:
             size_t i;
             
             for (i = 0; i < node->node_count; i++)
@@ -25546,6 +28752,10 @@ Py_LOCAL_INLINE(BOOL) record_subpattern_repeats_and_fuzzy_sections(RE_Node*
                 return FALSE;
             node = node->next_1.node;
             break;
+        case RE_OP_CODE_CALL_REPEAT:
+        case RE_OP_CODE_CALL_REPEAT_HLT:
+        case RE_OP_CODE_EXEC_REPEAT:
+        case RE_OP_CODE_EXEC_REPEAT_HLT:
         case RE_OP_GREEDY_REPEAT:
         case RE_OP_LAZY_REPEAT:
             /* Record the repeat index. */
@@ -25823,7 +29033,7 @@ Py_LOCAL_INLINE(void) set_test_nodes(PatternObject* pattern) {
         if (!(node->status & RE_STATUS_STRING))
             set_test_node(&node->nonstring.next_2);
         for (j = 0; j < node->node_count; j++)
-            set_test_node(&node->nodes[j].node);
+            set_test_node(&node->nodes[j]);
     }
 }
 
@@ -26579,28 +29789,40 @@ Py_LOCAL_INLINE(int) build_CHARACTER_or_PROPERTY(RE_CompileArgs* args) {
     return RE_ERROR_SUCCESS;
 }
 
-/* Builds an EXEC_CODE node. */
-Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
+/* Builds a CODE_CALL node. */
+Py_LOCAL_INLINE(int) build_CODE_CALL(RE_CompileArgs* args) {
     BOOL optimistic;
     RE_UINT8 op;
     RE_Node* node;
 
-    /* codes: opcode, code_id, halt_timer. */
+    /* codes: opcode, code_id, arg. */
     if (args->code + 2 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
     switch (args->code[0]) {
-    case RE_OP_EXEC_CODE_OPT:
+    case RE_OP_CODE_CALL_OPT:
         optimistic = TRUE;
-        op = RE_OP_EXEC_CODE;
+        op = RE_OP_CODE_CALL;
         break;
-    case RE_OP_EXEC_CODE_ADV_OPT:
+    case RE_OP_CODE_CALL_HLT_OPT:
         optimistic = TRUE;
-        op = RE_OP_EXEC_CODE_ADV;
+        op = RE_OP_CODE_CALL_HLT;
         break;
-    case RE_OP_EXEC_CODE_REV_OPT:
+    case RE_OP_CODE_CALL_ADV_OPT:
         optimistic = TRUE;
-        op = RE_OP_EXEC_CODE_REV;
+        op = RE_OP_CODE_CALL_ADV;
+        break;
+    case RE_OP_CODE_CALL_ADV_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_ADV_HLT;
+        break;
+    case RE_OP_CODE_CALL_REV_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_REV;
+        break;
+    case RE_OP_CODE_CALL_REV_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_REV_HLT;
         break;
     default:
         optimistic = FALSE;
@@ -26634,9 +29856,10 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE(RE_CompileArgs* args) {
     return RE_ERROR_SUCCESS;
 }
 
-/* Builds an EXEC_CODE_CONDITIONAL node. */
-Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
-    size_t node_count;
+/* Builds a CODE_CALL_CONDITIONAL node. */
+Py_LOCAL_INLINE(int) build_CODE_CALL_CONDITIONAL(RE_CompileArgs* args) {
+    BOOL optimistic;
+    RE_UINT8 op;
     RE_Node* case_node;
     RE_Node* join_node;
     RE_CompileArgs subargs;
@@ -26645,20 +29868,37 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
     BOOL locked;
     size_t index;
 
-    /* codes: opcode, code_id, halt_timer, case_count, next, ..., end. */
+    /* codes: opcode, code_id, arg, case_count, next, ..., end. */
     if (args->code + 4 > args->end_code)
         return RE_ERROR_ILLEGAL;
 
-    if (args->code[0] != RE_OP_EXEC_CODE_CONDITIONAL_OPT)
-        args->locked_min_width = TRUE;
+    switch (args->code[0]) {
+    case RE_OP_CODE_CALL_CONDITIONAL_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_CONDITIONAL;
+        break;
+    case RE_OP_CODE_CALL_CONDITIONAL_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_CONDITIONAL_HLT;
+        break;
+    default:
+        optimistic = FALSE;
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
 
     int flags = 0;
     if (args->forward)
         flags |= RE_STATUS_REVERSE;
 
     /* Create nodes for the start and end of the structure. */
-    case_node = create_node(args->pattern, RE_OP_EXEC_CODE_CONDITIONAL, flags,
-      0, 2, (size_t)args->code[3]);
+    case_node = create_node(args->pattern, op, flags, 0, 2,
+      (size_t)args->code[3]);
     join_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
     if (!case_node || !join_node)
         return RE_ERROR_MEMORY;
@@ -26714,6 +29954,411 @@ Py_LOCAL_INLINE(int) build_EXEC_CODE_CONDITIONAL(RE_CompileArgs* args) {
         args->min_width += min_width;
 
     args->all_atomic = FALSE;
+
+    return RE_ERROR_SUCCESS;
+}
+
+/* Builds a CODE_CALL_REPEAT node. */
+Py_LOCAL_INLINE(int) build_CODE_CALL_REPEAT(RE_CompileArgs* args) {
+    BOOL optimistic;
+    RE_UINT8 op;
+    RE_Node* repeat_node;
+    size_t index;
+    RE_CompileArgs subargs;
+    int status;
+
+    /* codes: opcode, code_id, arg, ..., end. */
+    if (args->code + 3 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    switch (args->code[0]) {
+    case RE_OP_CODE_CALL_REPEAT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_REPEAT_OPT;
+        break;
+    case RE_OP_CODE_CALL_REPEAT_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_CALL_REPEAT_HLT;
+        break;
+    default:
+        optimistic = FALSE;
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
+
+    index = args->pattern->repeat_count;
+
+    /* Create the node. */
+    repeat_node = create_node(args->pattern, op, 0, 0, 4, 0);
+    if (!repeat_node || !record_repeat(args->pattern, index,
+      args->repeat_depth))
+        return RE_ERROR_MEMORY;
+
+    repeat_node->values[0] = (RE_CODE)index;
+    repeat_node->values[1] = args->code[1];
+    repeat_node->values[2] = args->forward;
+    repeat_node->values[3] = args->code[2];
+
+    args->code += 3;
+
+    if (args->within_fuzzy)
+        args->pattern->repeat_info[index].status |= RE_STATUS_BODY;
+
+    /* Compile the 'body' and check that we've reached the end of it.
+     */
+    subargs = *args;
+    subargs.visible_captures = TRUE;
+    ++subargs.repeat_depth;
+    status = build_sequence(&subargs);
+    if (status != RE_ERROR_SUCCESS)
+        return status;
+
+    if (subargs.code[0] != RE_OP_END)
+        return RE_ERROR_ILLEGAL;
+
+    args->code = subargs.code;
+    args->has_captures |= subargs.has_captures;
+    args->is_fuzzy |= subargs.is_fuzzy;
+    args->has_groups |= subargs.has_groups;
+    args->has_repeats = TRUE;
+    args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
+
+    ++args->code;
+
+    RE_Node* end_repeat_node;
+    RE_Node* end_node;
+    
+    switch (repeat_node->op) {
+    case RE_OP_CODE_CALL_REPEAT:
+        op = RE_OP_CODE_CALL_END_REPEAT;
+        break;
+    case RE_OP_CODE_CALL_REPEAT_HLT:
+        op = RE_OP_CODE_CALL_END_REPEAT_HLT;
+        break;
+    }
+
+    end_repeat_node = create_node(args->pattern, op, 0,
+      args->forward ? 1 : -1, 4, 0);
+    if (!end_repeat_node)
+        return RE_ERROR_MEMORY;
+
+    end_repeat_node->values[0] = repeat_node->values[0];
+    end_repeat_node->values[1] = repeat_node->values[1];
+    end_repeat_node->values[2] = args->forward;
+    end_repeat_node->values[3] = repeat_node->values[3];
+
+    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0,
+      0);
+    if (!end_node)
+        return RE_ERROR_MEMORY;
+
+    if (args->all_atomic && args->code < args->end_code &&
+      args->code[0] == RE_OP_END && !args->within_fuzzy)
+        end_repeat_node->status |= RE_STATUS_ALL_ATOMIC;
+
+    /* Append the new sequence. */
+    add_node(args->end, repeat_node);
+    add_node(repeat_node, subargs.start);
+    add_node(repeat_node, end_node);
+    add_node(subargs.end, end_repeat_node);
+    add_node(end_repeat_node, subargs.start);
+    add_node(end_repeat_node, end_node);
+    args->end = end_node;
+
+    if (!(args->all_atomic && args->code < args->end_code && args->code[0] !=
+      RE_OP_END && !args->within_fuzzy))
+        args->all_atomic = FALSE;
+
+    return RE_ERROR_SUCCESS;
+}
+
+/* Builds a CODE_EXEC node. */
+Py_LOCAL_INLINE(int) build_CODE_EXEC(RE_CompileArgs* args) {
+    BOOL optimistic;
+    RE_UINT8 op;
+    RE_Node* node;
+
+    /* codes: opcode, code_id. */
+    if (args->code + 1 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    switch (args->code[0]) {
+    case RE_OP_CODE_EXEC_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC;
+        break;
+    case RE_OP_CODE_EXEC_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_HLT;
+        break;
+    case RE_OP_CODE_EXEC_ADV_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_ADV;
+        break;
+    case RE_OP_CODE_EXEC_ADV_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_ADV_HLT;
+        break;
+    case RE_OP_CODE_EXEC_REV_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_REV;
+        break;
+    case RE_OP_CODE_EXEC_REV_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_REV_HLT;
+        break;
+    default:
+        optimistic = FALSE;
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
+
+    int flags = 0;
+    if (args->forward)
+        flags |= RE_STATUS_REVERSE;
+
+    /* Create the node. */
+    node = create_node(args->pattern, op, flags, 0, 1, 0);
+    if (!node)
+        return RE_ERROR_MEMORY;
+
+    node->values[0] = args->code[1];
+
+    args->code += 2;
+
+    /* Append the node. */
+    add_node(args->end, node);
+    args->end = node;
+
+    return RE_ERROR_SUCCESS;
+}
+
+/* Builds a CODE_EXEC_CONDITIONAL node. */
+Py_LOCAL_INLINE(int) build_CODE_EXEC_CONDITIONAL(RE_CompileArgs* args) {
+    BOOL optimistic;
+    RE_UINT8 op;
+    RE_Node* case_node;
+    RE_Node* join_node;
+    RE_CompileArgs subargs;
+    int status;
+    Py_ssize_t min_width;
+    BOOL locked;
+    size_t index;
+
+    /* codes: opcode, code_id, case_count, next, ..., end. */
+    if (args->code + 4 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    switch (args->code[0]) {
+    case RE_OP_CODE_EXEC_CONDITIONAL_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_CONDITIONAL;
+        break;
+    case RE_OP_CODE_EXEC_CONDITIONAL_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_CONDITIONAL_HLT;
+        break;
+    default:
+        optimistic = FALSE;
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
+
+    int flags = 0;
+    if (args->forward)
+        flags |= RE_STATUS_REVERSE;
+
+    /* Create nodes for the start and end of the structure. */
+    case_node = create_node(args->pattern, op, flags, 0, 1,
+      (size_t)args->code[2]);
+    join_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0, 0);
+    if (!case_node || !join_node)
+        return RE_ERROR_MEMORY;
+
+    case_node->values[0] = args->code[1];
+
+    args->code += 3;
+
+    /* Append the node. */
+    add_node(args->end, case_node);
+    add_node(case_node, join_node);
+    args->end = join_node;
+
+    min_width = PY_SSIZE_T_MAX;
+    locked = args->locked_min_width;
+
+    subargs = *args;
+    index = 0;
+
+    while (subargs.code < subargs.end_code && subargs.code[0] == RE_OP_NEXT) {
+        /* Skip over the 'NEXT' opcode. */
+        ++subargs.code;
+
+        subargs.locked_min_width = locked;
+
+        /* Compile the sequence until the next 'NEXT' opcode. */
+        status = build_sequence(&subargs);
+        if (status != RE_ERROR_SUCCESS)
+            return status;
+
+        min_width = min_ssize_t(min_width, subargs.min_width);
+
+        args->has_captures |= subargs.has_captures;
+        args->is_fuzzy |= subargs.is_fuzzy;
+        args->has_groups |= subargs.has_groups;
+        args->has_repeats |= subargs.has_repeats;
+        args->locked_min_width |= subargs.locked_min_width;
+
+        case_node->nodes[index++].node = subargs.start;
+        add_node(subargs.end, join_node);
+    }
+
+    /* We should have reached the end of the conditional. */
+    if (subargs.code[0] != RE_OP_END)
+        return RE_ERROR_ILLEGAL;
+
+    args->code = subargs.code;
+    args->visible_capture_count = subargs.visible_capture_count;
+
+    ++args->code;
+    if (!locked)
+        args->min_width += min_width;
+
+    args->all_atomic = FALSE;
+
+    return RE_ERROR_SUCCESS;
+}
+
+/* Builds a CODE_EXEC_REPEAT node. */
+Py_LOCAL_INLINE(int) build_CODE_EXEC_REPEAT(RE_CompileArgs* args) {
+    BOOL optimistic;
+    RE_UINT8 op;
+    RE_Node* repeat_node;
+    size_t index;
+    RE_CompileArgs subargs;
+    int status;
+
+    /* codes: opcode, code_id, ..., end. */
+    if (args->code + 2 > args->end_code)
+        return RE_ERROR_ILLEGAL;
+
+    switch (args->code[0]) {
+    case RE_OP_CODE_EXEC_REPEAT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_REPEAT_OPT;
+        break;
+    case RE_OP_CODE_EXEC_REPEAT_HLT_OPT:
+        optimistic = TRUE;
+        op = RE_OP_CODE_EXEC_REPEAT_HLT;
+        break;
+    default:
+        optimistic = FALSE;
+        op = (RE_UINT8)args->code[0];
+        break;
+    }
+
+    /* To ensure running the code, the minimum width cannot be larger than
+     * the current width.
+     */
+    args->locked_min_width = !optimistic;
+
+    index = args->pattern->repeat_count;
+
+    /* Create the node. */
+    repeat_node = create_node(args->pattern, op, 0, 0, 3, 0);
+    if (!repeat_node || !record_repeat(args->pattern, index,
+      args->repeat_depth))
+        return RE_ERROR_MEMORY;
+
+    repeat_node->values[0] = (RE_CODE)index;
+    repeat_node->values[1] = args->code[1];
+    repeat_node->values[2] = args->forward;
+
+    args->code += 2;
+
+    if (args->within_fuzzy)
+        args->pattern->repeat_info[index].status |= RE_STATUS_BODY;
+
+    /* Compile the 'body' and check that we've reached the end of it.
+     */
+    subargs = *args;
+    subargs.visible_captures = TRUE;
+    ++subargs.repeat_depth;
+    status = build_sequence(&subargs);
+    if (status != RE_ERROR_SUCCESS)
+        return status;
+
+    if (subargs.code[0] != RE_OP_END)
+        return RE_ERROR_ILLEGAL;
+
+    args->code = subargs.code;
+    args->has_captures |= subargs.has_captures;
+    args->is_fuzzy |= subargs.is_fuzzy;
+    args->has_groups |= subargs.has_groups;
+    args->has_repeats = TRUE;
+    args->visible_capture_count = subargs.visible_capture_count;
+    args->locked_min_width |= subargs.locked_min_width;
+
+    ++args->code;
+
+    RE_Node* end_repeat_node;
+    RE_Node* end_node;
+    
+    switch (repeat_node->op) {
+    case RE_OP_CODE_EXEC_REPEAT:
+        op = RE_OP_CODE_EXEC_END_REPEAT;
+        break;
+    case RE_OP_CODE_EXEC_REPEAT_HLT:
+        op = RE_OP_CODE_EXEC_END_REPEAT_HLT;
+        break;
+    }
+
+    end_repeat_node = create_node(args->pattern, op, 0,
+      args->forward ? 1 : -1, 3, 0);
+    if (!end_repeat_node)
+        return RE_ERROR_MEMORY;
+
+    end_repeat_node->values[0] = repeat_node->values[0];
+    end_repeat_node->values[1] = repeat_node->values[1];
+    end_repeat_node->values[2] = args->forward;
+
+    end_node = create_node(args->pattern, RE_OP_BRANCH, 0, 0, 0,
+      0);
+    if (!end_node)
+        return RE_ERROR_MEMORY;
+
+    if (args->all_atomic && args->code < args->end_code &&
+      args->code[0] == RE_OP_END && !args->within_fuzzy)
+        end_repeat_node->status |= RE_STATUS_ALL_ATOMIC;
+
+    /* Append the new sequence. */
+    add_node(args->end, repeat_node);
+    add_node(repeat_node, subargs.start);
+    add_node(repeat_node, end_node);
+    add_node(subargs.end, end_repeat_node);
+    add_node(end_repeat_node, subargs.start);
+    add_node(end_repeat_node, end_node);
+    args->end = end_node;
+
+    if (!(args->all_atomic && args->code < args->end_code && args->code[0] !=
+      RE_OP_END && !args->within_fuzzy))
+        args->all_atomic = FALSE;
 
     return RE_ERROR_SUCCESS;
 }
@@ -27762,21 +31407,73 @@ Py_LOCAL_INLINE(int) build_sequence(RE_CompileArgs* args) {
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
-        case RE_OP_EXEC_CODE:
-        case RE_OP_EXEC_CODE_OPT:
-        case RE_OP_EXEC_CODE_ADV:
-        case RE_OP_EXEC_CODE_ADV_OPT:
-        case RE_OP_EXEC_CODE_REV:
-        case RE_OP_EXEC_CODE_REV_OPT:
-            /* Embedded python code. */
-            status = build_EXEC_CODE(args);
+        case RE_OP_CODE_CALL:
+        case RE_OP_CODE_CALL_OPT:
+        case RE_OP_CODE_CALL_HLT:
+        case RE_OP_CODE_CALL_HLT_OPT:
+        case RE_OP_CODE_CALL_ADV:
+        case RE_OP_CODE_CALL_ADV_OPT:
+        case RE_OP_CODE_CALL_ADV_HLT:
+        case RE_OP_CODE_CALL_ADV_HLT_OPT:
+        case RE_OP_CODE_CALL_REV:
+        case RE_OP_CODE_CALL_REV_OPT:
+        case RE_OP_CODE_CALL_REV_HLT:
+        case RE_OP_CODE_CALL_REV_HLT_OPT:
+            /* Called code. */
+            status = build_CODE_CALL(args);
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
-        case RE_OP_EXEC_CODE_CONDITIONAL:
-        case RE_OP_EXEC_CODE_CONDITIONAL_OPT:
-            /* Embedded python code conditional. */
-            status = build_EXEC_CODE_CONDITIONAL(args);
+        case RE_OP_CODE_CALL_CONDITIONAL:
+        case RE_OP_CODE_CALL_CONDITIONAL_OPT:
+        case RE_OP_CODE_CALL_CONDITIONAL_HLT:
+        case RE_OP_CODE_CALL_CONDITIONAL_HLT_OPT:
+            /* Called code conditional. */
+            status = build_CODE_CALL_CONDITIONAL(args);
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+            break;
+        case RE_OP_CODE_CALL_REPEAT:
+        case RE_OP_CODE_CALL_REPEAT_OPT:
+        case RE_OP_CODE_CALL_REPEAT_HLT:
+        case RE_OP_CODE_CALL_REPEAT_HLT_OPT:
+            /* Called code repeat. */
+            status = build_CODE_CALL_REPEAT(args);
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+            break;
+        case RE_OP_CODE_EXEC:
+        case RE_OP_CODE_EXEC_OPT:
+        case RE_OP_CODE_EXEC_HLT:
+        case RE_OP_CODE_EXEC_HLT_OPT:
+        case RE_OP_CODE_EXEC_ADV:
+        case RE_OP_CODE_EXEC_ADV_OPT:
+        case RE_OP_CODE_EXEC_ADV_HLT:
+        case RE_OP_CODE_EXEC_ADV_HLT_OPT:
+        case RE_OP_CODE_EXEC_REV:
+        case RE_OP_CODE_EXEC_REV_OPT:
+        case RE_OP_CODE_EXEC_REV_HLT:
+        case RE_OP_CODE_EXEC_REV_HLT_OPT:
+            /* Executed code. */
+            status = build_CODE_EXEC(args);
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+            break;
+        case RE_OP_CODE_EXEC_CONDITIONAL:
+        case RE_OP_CODE_EXEC_CONDITIONAL_OPT:
+        case RE_OP_CODE_EXEC_CONDITIONAL_HLT:
+        case RE_OP_CODE_EXEC_CONDITIONAL_HLT_OPT:
+            /* Executed code conditional. */
+            status = build_CODE_EXEC_CONDITIONAL(args);
+            if (status != RE_ERROR_SUCCESS)
+                return status;
+            break;
+        case RE_OP_CODE_EXEC_REPEAT:
+        case RE_OP_CODE_EXEC_REPEAT_OPT:
+        case RE_OP_CODE_EXEC_REPEAT_HLT:
+        case RE_OP_CODE_EXEC_REPEAT_HLT_OPT:
+            /* Executed code repeat. */
+            status = build_CODE_EXEC_REPEAT(args);
             if (status != RE_ERROR_SUCCESS)
                 return status;
             break;
@@ -28090,13 +31787,16 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     PyObject* required_chars;
     Py_ssize_t req_flags;
     size_t public_group_count;
-    PyObject* embedded_code;
+    PyObject* exec_code;
     PyObject* globals;
     PyObject* locals;
-    PyObject* modified_pattern;
     PyObject* codeindex;
-    size_t code_count;
+    PyObject* callindex;
+    PyObject* indexcall;
+    PyObject* call_code;
+    size_t exec_code_count;
     PyObject** compiled_code;
+    size_t call_code_count;
     BOOL unpacked;
     Py_ssize_t code_len;
     RE_CODE* code;
@@ -28110,10 +31810,11 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     BOOL ascii;
     BOOL ok;
 
-    if (!PyArg_ParseTuple(args, "OnOOOOOnOnnOOOOO:re_compile", &pattern, &flags,
-      &code_list, &groupindex, &indexgroup, &named_lists, &named_list_indexes,
-      &req_offset, &required_chars, &req_flags, &public_group_count,
-      &embedded_code, &globals, &locals, &modified_pattern, &codeindex))
+    if (!PyArg_ParseTuple(args, "OnOOOOOnOnnOOOOOOO:re_compile", &pattern,
+      &flags, &code_list, &groupindex, &indexgroup, &named_lists,
+      &named_list_indexes, &req_offset, &required_chars, &req_flags,
+      &public_group_count, &exec_code, &globals, &locals, &codeindex,
+      &callindex, &indexcall, &call_code))
         return NULL;
 
     /* If it came from a pickled source, code_list will be a packed code list
@@ -28157,25 +31858,18 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     }
 
     /* Assert valid globals and locals. */
-    if (globals != Py_None && !PyDict_Check(globals)) {
+    if (!check_globals(globals) || !check_locals(locals)) {
         re_dealloc(code);
-        set_error(RE_ERROR_BAD_GLOBALS, NULL);
-        if (unpacked)
-            Py_DECREF(code_list);
-        return NULL;
-    }
-    if (locals != Py_None && !PyMapping_Check(locals)) {
-        re_dealloc(code);
-        set_error(RE_ERROR_BAD_LOCALS, NULL);
         if (unpacked)
             Py_DECREF(code_list);
         return NULL;
     }
 
     /* Allocate memory for compiled code. */
-    code_count = (size_t)PyTuple_GET_SIZE(embedded_code);
-    if (code_count) {
-        compiled_code = (PyObject**)re_alloc(code_count * sizeof(PyObject*));
+    exec_code_count = (size_t)PyTuple_GET_SIZE(exec_code);
+    if (exec_code_count) {
+        compiled_code = (PyObject**)re_alloc(exec_code_count *
+          sizeof(PyObject*));
         if (!compiled_code) {
             re_dealloc(code);
             set_error(RE_ERROR_MEMORY, NULL);
@@ -28184,7 +31878,7 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
             return NULL;
         }
 
-        memset(compiled_code, 0, code_count * sizeof(PyObject*));
+        memset(compiled_code, 0, exec_code_count * sizeof(PyObject*));
     } else
         compiled_code = NULL;
 
@@ -28219,7 +31913,6 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
 
     /* Initialise the PatternObject. */
     self->pattern = pattern;
-    self->modified_pattern = modified_pattern;
     self->module = self_;
     self->flags = flags;
     self->packed_code_list = packed_code_list;
@@ -28232,13 +31925,17 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->group_end_index = 0;
     self->groupindex = groupindex;
     self->indexgroup = indexgroup;
-    self->code = embedded_code;
+    self->code = exec_code;
     self->globals = globals;
     self->locals = locals;
     self->state = Py_None;
-    self->code_count = code_count;
+    self->exec_code_count = exec_code_count;
     self->compiled_code = compiled_code;
     self->codeindex = codeindex;
+    self->call_code_count = (size_t)PyDict_Size(callindex);
+    self->callindex = callindex;
+    self->indexcall = indexcall;
+    self->call_code = call_code;
     self->code_dropped = FALSE;
     self->named_lists = named_lists;
     self->named_lists_count = (size_t)PyDict_Size(named_lists);
@@ -28266,7 +31963,6 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     self->req_string = NULL;
     self->locale_info = NULL;
     Py_INCREF(self->pattern);
-    Py_INCREF(self->modified_pattern);
     Py_INCREF(self->module);
     if (unpacked) {
         Py_INCREF(self->packed_code_list);
@@ -28278,6 +31974,9 @@ static PyObject* re_compile(PyObject* self_, PyObject* args) {
     Py_INCREF(self->state);
     Py_INCREF(self->code);
     Py_INCREF(self->codeindex);
+    Py_INCREF(self->callindex);
+    Py_INCREF(self->indexcall);
+    Py_INCREF(self->call_code);
     Py_INCREF(self->named_lists);
     Py_INCREF(self->named_list_indexes);
     Py_INCREF(self->required_chars);

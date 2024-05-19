@@ -4483,43 +4483,26 @@ thing
         self.assertDictEqual(ls, {"func": func, "bar": 2, "baz": 3})
         self.assertIsNotNone(pat.fullmatch("bar"))
         self.assertDictEqual(ls, {"func": func, "bar": 1, "baz": 4})
-
-        # Changing variables while matching and evaluates code while parsing.
-        idx = 1
-        def func(s):
-            nonlocal idx
-            res = s * idx
-            idx += 1
-            return res
-        pattern = "(?c)(??C=foo) (??{foo}{f('a')}) (??C=foo)"
-        pat = regex.compile(pattern, locals={"f": func})
-        self.assertEqual(pat.pattern, "(?c)a aa aaa")
-        self.assertEqual(pat.original_pattern, pattern)
-        # Evaluated code isn't stored in the pattern.
-        self.assertTupleEqual(pat.code, ())
-        self.assertDictEqual(pat.codeindex, {})
-        self.assertEqual(idx, 4)
-        self.assertIsNotNone(pat.match("a aa aaa"))
-
+        
         # Code conditionals.
         pat = regex.compile("""(?cx)
         (?(?{
             if foo == 0:
-                regex.state().case(-1)
+                regex.state().branch(-1)
             elif foo == 1:
-                regex.state().case(0)
+                regex.state().branch(0)
             elif foo == 2:
-                regex.state().case(1)
+                regex.state().branch(1)
             elif foo == 3:
-                regex.state().case(2)
+                regex.state().branch(2)
             elif foo == 4:
-                regex.state().case(3)
+                regex.state().branch(3)
             elif foo == 5:
                 regex.state().fail()
             elif foo == 6:
                 regex.state().advance()
             elif foo == 7:
-                regex.state().case("abc")
+                regex.state().branch("abc")
         })
             abc
         |
@@ -4529,41 +4512,41 @@ thing
         )
         z
         """, globals={"regex": regex})
-        self.assertRaisesRegex(ValueError, "^case index has to be positive$",
+        self.assertRaisesRegex(ValueError, "^branch should be positive$",
           lambda: pat.match("abcz", locals={"foo": 0}))
         self.assertIsNotNone(pat.match("abcz", locals={"foo": 1}))
         self.assertIsNotNone(pat.match("defz", locals={"foo": 2}))
         self.assertIsNotNone(pat.match("ghiz", locals={"foo": 3}))
-        self.assertRaisesRegex(ValueError, "^case index should be no more than 2$",
+        self.assertRaisesRegex(ValueError, "^branch should be no more than 2$",
           lambda: pat.match("abcz", locals={"foo": 4}))
         self.assertIsNone(pat.match("abcz", locals={"foo": 5}))
         self.assertIsNone(pat.match("abcz", locals={"foo": 6}))
         self.assertIsNotNone(pat.match("z", locals={"foo": 6}))
-        self.assertRaisesRegex(TypeError, "^case index must be an integer$",
+        self.assertRaisesRegex(TypeError, "^argument must be an integer$",
           lambda: pat.match("abcz", locals={"foo": 7}))
 
-        self.assertRaisesRegex(TypeError, "^case only allowed in conditionals$",
-          lambda: regex.match("(?c)(?{regex.state().case(0)})",
+        self.assertRaisesRegex(TypeError, "^branch is only allowed in conditionals$",
+          lambda: regex.match("(?c)(?{regex.state().branch(0)})",
           "abc", globals={"regex": regex}))
 
         # Get maximum depth of nested braces
         ls = {}
         pat = regex.compile("""(?cx)
-        (?+{depth = max_depth = 0})
+        (?{>depth = max_depth = 0})
         (?<brace_pair>
             {
-            (?+{
+            (?{>
                 depth += 1
                 max_depth = max(max_depth, depth)
             })
-            (??{non_brace}{"[^{}]*+"})
+            [^{}]*+
             (?:
                 (?&brace_pair)
-                (??C=non_brace)
+                [^{}]*+
             )*+
             (?:
                 }
-                (?+{depth -= 1})
+                (?{>depth -= 1})
             |
                 $
             )
@@ -4578,7 +4561,7 @@ thing
         pat = regex.compile("""(?cx)
         ((.)\\2*+)
         ((.)\\4*+)
-        (?+{
+        (?{>
             s = regex.state()
             g1 = s.group(1)
             g2 = s.group(3)
@@ -4622,72 +4605,43 @@ thing
 
         # NO_CODE ignores parsed code.
         self.assertTupleEqual(regex.compile("(?n)(?{foo = 2})").code, ())
-        self.assertEqual(regex.compile("(??{\"foo = 2\"})").pattern,
-          "(??{\"foo = 2\"})")
-        self.assertEqual(regex.compile("(?c)(??{\"foo = 2\"})").pattern,
-          "(?c)foo = 2")
-
-        # NO_CODE doesn't prevent evaluation.
-        pat = regex.compile("(?cn)(??{foo}{'abc'}) (??C=foo)")
-        self.assertTupleEqual(pat.code, ())
-        self.assertDictEqual(pat.codeindex, {})
-        self.assertEqual(pat.pattern, "(?cn)abc abc")
 
         # Cannot turn CODE flag on when scoped. 
         self.assertRaisesRegex(regex.error,
-          "^cannot turn CODE flag on within evaluated code at position 8\n\tin evaluated code 0 at position 4$",
-          lambda: regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
-          locals={"f": lambda: "(?c:(??{\"foo\"}))"}))
-        self.assertEqual(regex.compile("(?c)(??{f\"(?-c:{f()})\"})",
-          locals={"f": lambda: "(??{\"foo\"})"}).pattern,
-          "(?c)(?-c:(??{\"foo\"}))")
-        self.assertEqual(regex.compile("(?c)(??{f()})",
-          locals={"f": lambda: "(??{\"foo\"})"}).pattern, "(?c)foo")
+          "^cannot turn CODE flag on when scoped at position 8$",
+          lambda: regex.compile("(?-c:(?c:foo))"))
 
         # Cannot turn NO_CODE flag off when scoped.
         self.assertRaisesRegex(regex.error,
-          "^cannot turn NO_CODE flag off within evaluated code at position 4\n\tin evaluated code 0 at position 8$",
-          lambda: regex.compile("(?c)(?n:(??{f()}))",
-          locals={"f": lambda: "(?-n:(??{\"foo\"}))"}))
-        self.assertEqual(regex.compile("(?cn)(??{f()})",
-          locals={"f": lambda: "(??{\"foo\"})"}).pattern,
-          "(?cn)foo")
+          "^cannot turn NO_CODE flag off when scoped at position 8$",
+          lambda: regex.compile("(?n:(?-n:foo))"))
 
         # Optimistic code doesn't disable certain optimizations.
         ls = {"c": 0}
-        self.assertIsNotNone(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+        self.assertIsNotNone(regex.match("(?c)(?{>=foo})a(?{=foo|c += 1})",
           "a", locals=ls))
         self.assertDictEqual(ls, {"c": 2})
         ls["c"] = 0
-        self.assertIsNone(regex.match("(?c)(?C+foo)a(?{foo}{c += 1})",
+        self.assertIsNone(regex.match("(?c)(?{>=foo})a(?{=foo|c += 1})",
           "b", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls["c"] = 0
-        self.assertIsNone(regex.match("(?c)(?C+foo)a(*{foo}{c += 1})",
+        self.assertIsNone(regex.match("(?c)(?{>=foo})a(*{=foo|c += 1})",
           "b", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls["c"] = 0
-        self.assertIsNone(regex.match("(?c)(*C+foo)a(?{foo}{c += 1})",
+        self.assertIsNone(regex.match("(?c)(*{>=foo})a(?{=foo|c += 1})",
           "b", locals=ls))
         self.assertDictEqual(ls, {"c": 0})
         ls = {}
         # Runs once despite the input string being shorter than the minimum width.
-        self.assertIsNone(regex.match("(?c)abc(?+{c = 1})def",
+        self.assertIsNone(regex.match("(?c)abc(?{>c = 1})def",
           "abc", locals=ls))
         self.assertDictEqual(ls, {"c": 1})
         ls = {}
-        self.assertIsNone(regex.match("(?c)abc(*+{c = 1})def",
+        self.assertIsNone(regex.match("(?c)abc(*{>c = 1})def",
           "abc", locals=ls))
         self.assertDictEqual(ls, {})
-
-        # Correct nested error messages.
-        self.assertRaisesRegex(regex.error,
-          "^invalid group reference at position 3\n\tin evaluated code 0 at position 0\n\tin evaluated code 0 at position 4$",
-          lambda: regex.compile("(?c)(??{'(??{\"(?(2)abc)\"})'})"))
-
-        # Recursive replacement of evaluated code.
-        self.assertEqual(regex.compile(
-          "(?c)(??C=foo) (??{'(??{foo}{\"bar\"})'})").pattern, "(?c)bar bar")
 
         # Last change of CODE flag is used as global flag.
         ls = {"l": 3}
@@ -4731,6 +4685,34 @@ thing
           "(?c)(?{s = regex.state(); s.fail(); s.advance()})a",
           globals={"regex": regex})
         self.assertIsNotNone(pat.match("a"))
+        
+        # Callouts and repeats
+        v = 0
+        def foo(state, arg):
+            if v <= 2:
+                state.branch(v)
+        def bar(state, arg):
+            if v <= 2:
+                state.next()
+            else:
+                state.advance()
+        def baz(state, arg):
+            nonlocal v
+            v = arg
+        pat = regex.compile("""(?cx)
+        (?(?{&foo})
+            abc (?{>&baz:1})
+        |
+            def (?{>&baz:2})
+        |
+            ghi (?{>&baz:3})
+        )(??{&bar})
+        """, callouts={"foo": foo, "bar": bar, "baz": baz})
+        self.assertIsNotNone(pat.match("abcdefghi"))
+        v = 0
+        self.assertIsNone(pat.match("abcdefgh"))
+        v = 0
+        self.assertIsNone(pat.match("abcdef"))
 
 def test_main():
     unittest.main(verbosity=2)
