@@ -1058,18 +1058,25 @@ The matching methods and functions support timeouts. The timeout (in seconds) ap
 Embedded code ``(?{code})``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(?{name}{code})`` code can be referenced by the given name.
+``(?{=name|code})`` code can can be referenced by the given name.
 
-``(?+{code})`` or ``(?+{name}{code})`` executes only on advancing.
+``(?{=name})`` use the referenced code, forward references are permitted.
 
-``(?-{code})`` or ``(?-{name}{code})`` executes only on backtracking.
+``(?{&name})`` call the specified callout instead of embedded code.
 
-Embedded code is executed whenever the engine encounters it.
-A reference to the ``StateObject`` can be gained via the module function ``state``.
-Using a ``StateObject`` outside the code block where it was created causes a ``TypeError``.
-The StateObject methods ``fail`` and ``advance`` cause the engine to advance or backtrack.
-Named code blocks can be referenced via that name.
-Globals and locals can be specified via the corresponding attributes in the methods for compiling and matching.
+``(?{&name:arg})`` callouts can have a single numeric argument.
+
+``(?{>...})`` act only on advancing.
+
+``(?{<...})`` act only on backtracking.
+
+``(*{...})`` don't disable certain optimisations.
+
+Code is called/executed whenever the engine encounters it.
+A reference to the ``StateObject`` can be gained via the module function ``state``, the pattern attribute ``state``, or as the first parameter of a callout.
+Using a StateObject after the engine resumed matching is not allowed.
+By default the engine resumes matching after the code ends, this can be changed by calling the method ``fail`` of the StateObject, which will cause the engine to advance.
+Since this is only determined after the code ends, using the method ``advance`` will revert it back to the default behaviour.
 
 .. sourcecode:: python
 
@@ -1078,47 +1085,32 @@ Globals and locals can be specified via the corresponding attributes in the meth
   >>> pattern.match("b")
   <regex.Match object; span=(0, 1), match='b'>
 
-Optimistic code ``(*{code})``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-``(*{name}{code})`` code can be referenced by the given name.
-
-``(*+{code})`` or ``(*+{name}{code})`` executes only on advancing.
-
-``(*-{code})`` or ``(*-{name}{code})`` executes only on backtracking.
-
-Embedded code disables certain optimizations to ensure running the code when execution would be expected.
-Optimistic code doesn't disable these optimizations, code may run less often than expected or not at all (especially on failure).
+Embedded code disables certain optimizations to run the code more often on failure.
+Optimistic code doesn't disable these optimizations, code may be executed less often than expected or not at all.
 
 .. sourcecode:: python
 
-  >> regex.match("(?c)a(?+{print('0')})b", "a")
-  0
-  >> regex.match("(?c)a(?+{print('0')})b", "ab")
-  0
+  >> regex.match("(?c)a(*{print(regex.state().backtracking)})b", "a", globals=globals())
+  >> regex.match("(?c)a(*{print(regex.state().backtracking)})b", "ab", globals=globals())
+  False
   <regex.Match object; span=(0, 2), match='ab'>
 
-The optimized code however doesn't run at all.
+The unoptimized code is executed, even though the engine already knows a match is impossible.
 
 .. sourcecode:: python
 
-  >> regex.match("(?c)a(*+{print('0')})b", "a")
-  >> regex.match("(?c)a(*+{print('0')})b", "ab")
-  0
+  >> regex.match("(?c)a(?{print(regex.state().backtracking)})b", "a", globals=globals())
+  False
+  True
+  >> regex.match("(?c)a(?{print(regex.state().backtracking)})b", "ab", globals=globals())
+  False
   <regex.Match object; span=(0, 2), match='ab'>
 
-Code references ``(?C=name)``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-``(?C+name)`` executes only on advancing.
-
-``(?C-name)`` executes only on backtracking.
-
-Throws an exception if no code of the given name exists, otherwise behaves like embedded code using the referenced code.
+Code references prevent code duplication.
 
 .. sourcecode:: python
 
-  >>> pattern = regex.compile("(?c)(?C=foo)(a)(?{foo}{print(regex.state().group(1))})", globals=globals())
+  >>> pattern = regex.compile("(?c)(?{>=foo})(a)(?{=foo|print(regex.state().group(1))})", globals=globals())
   >>> pattern.match("a")
   None
   a
@@ -1126,54 +1118,40 @@ Throws an exception if no code of the given name exists, otherwise behaves like 
   >>> pattern.match("b")
   None
 
-Optimistic code references ``(*C=name)``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Code conditionals ``(?(?{code})...)``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``(*C+name)`` executes only on advancing.
+``(?(?{=name|code})...)`` code can can be referenced by the given name.
 
-``(*C-name)`` executes only on backtracking.
+``(?(?{=name})...)`` use the referenced code, forward references are permitted.
 
-Behaves like code references without disabling certain optimizations.
+``(?(?{&name})...)`` call the specified callout instead of embedded code.
 
-Code conditionals ``(?(?{code})yes|no)``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``(?(?{&name:arg})...)`` callouts can have a single numeric argument.
 
-``(?(?{name}{code})yes|no)`` code can be referenced by the given name.
+``(?(*{...})...)`` don't disable certain optimisations.
 
-``(?(?C=name)yes|no)`` uses the referenced code instead.
+Calls/Executes the code once to determine which branch to match next.
+An arbitrary amount of branches is permitted.
+Calling ``fail`` backtracks without matching anything, ``advance`` will skip the entire conditional.
+The method ``branch`` takes an integer and selects a branch.
+Not calling any method will implicitly advance.
 
-The code is executed once to determine which branch to match next.
-If the ``fail`` method is called, the no_branch matches next, otherwise the yes_branch.
+Code repeats ``...(??{code})``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Optimistic code conditionals ``(?(*{code})yes|no)``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``...(??{=name|code})`` code can can be referenced by the given name.
 
-``(?(*{name}{code})yes|no)`` code can be referenced by the given name.
+``...(??{=name})`` use the referenced code, forward references are permitted.
 
-``(?(*C=name)yes|no)`` uses the referenced code instead.
+``...(??{&name})`` call the specified callout instead of embedded code.
 
-Behave like code conditionals without disabling certain optimizations.
+``...(??{&name:arg})`` callouts can have a single numeric argument.
 
-Evaluated code ``(??{code})``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+``...(**({...})`` don't disable certain optimisations.
 
-``(??{name}{code})`` code can be referenced by the given name.
-
-Evaluates the code only when the ``CODE`` flag is set.
-The result has to be a string, which is then inserted into the pattern and parsed.
-The unmodified pattern is accessible via the attribute ``PatternObject.original_pattern``.
-
-.. sourcecode:: python
-
-  >>> pat = regex.compile("(?c)(??{f('a')})", locals={"f": lambda s: s * 3})
-  >>> pat.pattern
-  '(?c)aaa'
-  >>> pat.original_pattern
-  "(?c)(??{f('a')})"
-
-Evaluated Code references ``(??C=name)``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Throws an exception if no code of the given name exists, otherwise behaves like evaluated code.
-Evaluated code blocks are evaluated left to right, references can refer to code that is declared later.
-Evaluated references are iteratively evaluated to ensure that as many named references as possible are evaluated.
+Calls/executes the code before every repeat.
+``advance`` will exit the repeat ``fail`` will start backtracking.
+``next`` requires a match of the repeated sequence and will backtrack, if that is not possible.
+``optional`` will attempt a match of the body but will advance if that is not possible.
+``lazy`` tries to advance, but will fall back to matching the body if it cannot advance.
